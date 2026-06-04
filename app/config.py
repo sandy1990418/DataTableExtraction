@@ -1,0 +1,27 @@
+from __future__ import annotations
+
+import os
+
+from dotenv import load_dotenv
+
+load_dotenv("../.env")
+
+
+class Settings:
+    def __init__(self) -> None:
+        self.OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
+        self.OPENAI_BASE_URL: str = os.getenv("OPENAI_BASE_URL", "")
+        self.OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", os.getenv("AI_MODEL", "gpt-4o-mini"))
+        self.MAX_TOKENS: int = int(os.getenv("MAX_TOKENS", "4096"))
+        self.TEMPERATURE: float = float(os.getenv("TEMPERATURE", "0.3"))
+        self.DOWNLOAD_TTL_SECONDS: int = int(os.getenv("DOWNLOAD_TTL_SECONDS", "600"))
+
+
+_settings: Settings | None = None
+
+
+def get_settings() -> Settings:
+    global _settings
+    if _settings is None:
+        _settings = Settings()
+    return _settings
