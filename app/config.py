@@ -12,7 +12,7 @@ load_dotenv(_PROJECT_ROOT / ".env")
 
 
 class Settings:
-    def __init__(self) -> None:
+    def __init__(self, **overrides) -> None:
         self.OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
         self.OPENAI_BASE_URL: str = os.getenv("OPENAI_BASE_URL", "")
         self.OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", os.getenv("AI_MODEL", "gpt-4o-mini"))
@@ -20,6 +20,8 @@ class Settings:
         self.TEMPERATURE: float = float(os.getenv("TEMPERATURE", "0.3"))
         self.DOWNLOAD_TTL_SECONDS: int = int(os.getenv("DOWNLOAD_TTL_SECONDS", "600"))
         self.SESSION_TTL_SECONDS: int = int(os.getenv("SESSION_TTL_SECONDS", "1800"))
+        for key, value in overrides.items():
+            setattr(self, key, value)
 
 
 _settings: Settings | None = None

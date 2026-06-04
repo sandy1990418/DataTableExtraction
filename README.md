@@ -1,9 +1,10 @@
 # DataTableExtraction
 
 Turn one or more Markdown documents (research papers, reports, issue trackers) into
-**canonical comparison tables** and a **PPTX deck**. The service builds a unified
-*evidence layer* from text, Markdown tables, and images (via vision), then has an LLM
-design and populate human-meaningful tables, plan slides, and render the deck.
+**hint-focused comparison tables** and a **PPTX deck**. The service builds a unified
+*evidence layer* from text, Markdown tables, and images (via vision), then runs an
+agent team that selects relevant evidence, designs table specs, reviews table quality
+before row population, fills grounded rows, and renders the deck.
 
 ```
 documents (markdown + images)
@@ -18,25 +19,32 @@ documents (markdown + images)
         │   image captions · chart insights · diagram summaries
         ▼
 ┌─────────────────────────────────────────────┐
-│ 4. extract      canonical_extractor.py       │  TWO-STAGE:
-│                                              │   (a) plan facets  → which tables + columns
-│                                              │   (b) populate     → fill rows from evidence
+│ 4. agent team   report_agent_team.py         │  ReportEvidenceAgent:
+│                                              │    select hint-relevant evidence
+│                                              │  TableIntentAgent:
+│                                              │    plan table specs
+│                                              │  TableSpecReviewAgent:
+│                                              │    catch bad/vague specs before rows
+│                                              │  TablePopulator + Grounding:
+│                                              │    fill and verify table rows
 └─────────────────────────────────────────────┘
-        │   canonical tables  (experiment_results, feature_comparison, …)
+        │   grounded tables  (metrics, architecture, efficiency, ...)
         ▼
 ┌─────────────────────────────────────────────┐
-│ 5. outline      ppt_planner.py               │  slides[], each with optional table_ref
-│ 6. render       tools/table_pptx.py          │  renders ONLY referenced tables → PPTX
+│ 5. compose      report_agent_team.py         │  PPT plan from produced tables
+│ 6. render       tools/table_pptx.py          │  table slides + text slides → PPTX
 └─────────────────────────────────────────────┘
         │
         ▼
    downloadable .pptx
 ```
 
-Why two-stage extraction? One-shot "extract tables" produces generic template columns
-(*Summary*, *Main Contribution*). Stage 1 first asks the model — anchored to the actual
-collection — *which* comparison dimensions a domain expert would want; stage 2 fills each
-table with example-anchored values. This yields tables a human would actually build.
+Why the agent team? One-shot "extract tables" tends to produce generic template columns
+(*Summary*, *Main Contribution*, *Accuracy*) even when the evidence contains precise
+metrics such as `F1`, `BLEU-1`, categories, model names, and benchmark tables. The
+agent team keeps checkpoints: select evidence by hint, plan table specs, review and
+revise bad specs, then populate and verify rows. The user-facing `/analyze` endpoint is
+still a single call.
 
 ---
 
@@ -54,7 +62,8 @@ app/
 │   ├── chat.py                   SYSTEM_PROMPT          (/chat assistant)
 │   ├── image.py                  IMAGE_SYSTEM           (vision analysis)
 │   ├── canonical.py              PLAN_SYSTEM, POPULATE_SYSTEM  (two-stage extraction)
-│   └── planner.py                PPT_PLANNER_SYSTEM     (slide outline)
+│   ├── planner.py                PPT_PLANNER_SYSTEM     (staged slide outline)
+│   └── qa.py                     row/spec review + revision prompts
 ├── routes/                       ← thin: route definitions only, no business logic
 │   ├── analyze.py                /evidence · /outline · /render · /analyze
 │   ├── chat.py                   /chat
@@ -65,7 +74,13 @@ app/
 │   ├── image_analysis.py         vision API per image (parallel)
 │   ├── evidence_layer.py         unify everything into typed EvidenceItems
 │   ├── canonical_extractor.py    two-stage table extraction
-│   ├── ppt_planner.py            slide-outline generation
+│   ├── report_agent_team.py      all-in-one agent team for /analyze
+│   ├── table_spec_qa.py          table spec review/revision before row population
+│   ├── table_agent_team.py       staged render-time table population/review
+│   ├── table_qa.py               row evidence-grounding review
+│   ├── table_revision.py         row revision after QA findings
+│   ├── evidence_selector.py      focused evidence selection for table specs
+│   ├── ppt_planner.py            staged slide-outline generation
 │   ├── session_store.py          TTL cache: /evidence result keyed by session_id
 │   ├── llm_service.py            /chat orchestration
 │   └── table_extraction.py       in-source table detection (markdown/html/tsv) for /chat
@@ -120,9 +135,10 @@ Then pass the `.md` via `file_path` (with `base_dir` pointing at the images fold
 
 ## API
 
-Two ways to use it: **all-in-one** (`/analyze`) for simple cases, or the **staged**
-endpoints (`/evidence` → `/outline` → `/render`) when you drive outline and slide
-generation separately (e.g. a Presenton-style flow).
+The primary path is **all-in-one agent mode** (`/analyze`): pass document paths plus a
+hint, and the agent team decides which evidence and tables matter. The staged endpoints
+(`/evidence` → `/outline` → `/render`) remain available for compatibility and for
+systems that need to drive outlines separately.
 
 ### Document input (shared)
 
@@ -137,10 +153,11 @@ generation separately (e.g. a Presenton-style flow).
 
 ---
 
-### `POST /analyze` — all-in-one
+### `POST /analyze` — all-in-one agent team
 
-Runs the whole pipeline and returns a download URL. Renders **only** the tables the
-generated outline references.
+Runs the report agent team and returns a download URL. The caller only supplies
+documents and a hint; the agent team selects evidence, plans/reviews table specs,
+populates grounded rows, composes a PPT plan, and renders the deck.
 
 ```jsonc
 // request
@@ -159,20 +176,50 @@ generated outline references.
   "ppt_plan": { "presentation_title": "...", "slides": [] },
   "rendered_tables": ["architecture_comparison", "benchmark_results"],
   "table_catalog": [ {"name": "...", "title": "...", "columns": ["..."], "column_count": 6} ],
-  "evidence_summary": "Evidence layer: 46 items ..."
+  "evidence_summary": "Evidence layer: 46 items ...",
+  "focused_evidence_count": 28,
+  "spec_reviews": [
+    {"name": "benchmark_results", "status": "pass", "warnings": [], "unsupported_columns": []}
+  ],
+  "qa_reviews": [],
+  "agent_trace": [
+    {"agent": "ReportEvidenceAgent", "action": "selected_hint_relevant_evidence", "detail": {}},
+    {"agent": "TableSpecReviewAgent", "action": "reviewed_specs", "detail": {}},
+    {"agent": "TableGroundingAgent", "action": "reviewed_rows", "detail": {}}
+  ],
+  "warnings": []
 }
 ```
 
-> **Lazy population.** Planning is cheap and runs up front; the expensive per-table row
-> population only runs for tables the outline references. A planned table that no slide
-> uses is never populated — you don't pay for it.
+The important quality gate is `spec_reviews`: table specs are checked before row
+population. This is where vague or unsupported columns should be caught before the
+system spends tokens filling a bad table.
+
+#### Script smoke test
+
+The smoke-test script now defaults to `/analyze` agent mode:
+
+```bash
+uvicorn app.main:app --port 8000
+python scripts/test_staged.py
+```
+
+It writes the PPTX to `~/Desktop/test_agent_report.pptx` by default and prints focused
+evidence count, planned tables, spec reviews, row QA reviews, and agent trace.
+
+To run the compatibility staged flow instead:
+
+```bash
+python scripts/test_staged.py --mode staged
+```
 
 ---
 
-### Staged flow (Presenton-style)
+### Staged flow (compatibility / Presenton-style)
 
-Run `/evidence` once, then drive outline and render separately. State is cached
-server-side under a `session_id`, so you only pass a short string between calls.
+Run `/evidence` once, then drive outline and render separately. This path is useful when
+another system owns the slide outline. State is cached server-side under a `session_id`,
+so you only pass a short string between calls.
 
 #### `POST /evidence` — plan the tables (run once, cheap)
 
@@ -227,18 +274,114 @@ and **column list** and selects which deserve a slide via `table_ref`.
 
 This is where row population happens — **lazily**, only for the tables the plan
 references, then cached on the session (a second `/render` is instant). Unreferenced
-tables are never populated or rendered.
+tables are never populated.
+
+Rendering now runs a LangGraph table-agent workflow:
+
+```
+SupervisorAgent
+  -> EvidenceSelectorAgent
+  -> TablePopulatorAgent
+  -> TableReviewerAgent
+      -> TableRevisionAgent -> TableReviewerAgent  (only when review fails)
+  -> deterministic PPTX renderer
+```
+
+The reviewer checks evidence grounding, sparse tables, and generic values such as
+`Yes` / `High` / `Moderate`. The PPTX renderer preserves non-table slides from the
+plan instead of dropping title, overview, or conclusion slides.
 
 ```jsonc
 // request
 { "session_id": "e8f2e768...", "ppt_plan": {}, "presentation_title": "..." }
 
 // response
-{ "type": "download", "url": "/download/<token>", "filename": "....pptx" }
+{
+  "type": "download",
+  "url": "/download/<token>",
+  "filename": "....pptx",
+  "rendered_tables": ["architecture_comparison"],
+  "qa_reviews": [
+    {"table_id": "architecture_comparison", "status": "pass",
+     "warnings": [], "unsupported_cells": []}
+  ],
+  "agent_trace": [
+    {"agent": "SupervisorAgent", "action": "resolved_fixed_workflow", "detail": {}},
+    {"agent": "EvidenceSelectorAgent", "action": "selected_focused_evidence", "detail": {}},
+    {"agent": "TablePopulatorAgent", "action": "populated_tables", "detail": {}},
+    {"agent": "TableReviewerAgent", "action": "reviewed_tables", "detail": {}}
+  ],
+  "warnings": []
+}
 ```
 
 If you render slides yourself instead of calling `/render`, the equivalent is: decide
 your `table_ref`s, then call the extractor's `populate_tables` for just those specs.
+
+#### Curl smoke test
+
+```bash
+BASE=http://localhost:8000
+
+curl -sS -X POST "$BASE/analyze" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "documents": [
+      {"file_path": "data/parsed/MemoryBank.md"},
+      {"file_path": "data/parsed/MemoryOS.md"},
+      {"file_path": "data/parsed/AMem.md"},
+      {"file_path": "data/parsed/MemGPT.md"}
+    ],
+    "hint": "compare LLM long-term memory architectures: mechanism, storage, retrieval, benchmarks, limitations",
+    "n_slides": 7,
+    "analyze_images": false
+  }'
+```
+
+Use the returned `url` to download:
+
+```bash
+curl -L -o /tmp/test_agent_report.pptx "$BASE/download/<TOKEN>"
+```
+
+For the compatibility staged flow, use `/evidence`, `/outline`, and `/render`:
+
+```bash
+curl -sS -X POST "$BASE/evidence" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "documents": [
+      {"file_path": "data/parsed/MemoryBank.md"},
+      {"file_path": "data/parsed/MemoryOS.md"},
+      {"file_path": "data/parsed/AMem.md"},
+      {"file_path": "data/parsed/MemGPT.md"}
+    ],
+    "hint": "compare LLM long-term memory architectures: mechanism, storage, retrieval, benchmarks, limitations",
+    "analyze_images": false
+  }'
+```
+
+Use the returned `session_id`:
+
+```bash
+curl -sS -X POST "$BASE/outline" \
+  -H 'Content-Type: application/json' \
+  -d '{"session_id": "<SESSION_ID>", "n_slides": 7}'
+```
+
+Use the returned `ppt_plan`:
+
+```bash
+curl -sS -X POST "$BASE/render" \
+  -H 'Content-Type: application/json' \
+  -d '{"session_id": "<SESSION_ID>", "ppt_plan": <PPT_PLAN_JSON>, "presentation_title": "memory_architecture_comparison"}'
+```
+
+Download the generated deck:
+
+```bash
+curl -L -o /tmp/test_staged.pptx "$BASE/download/<TOKEN>"
+```
 
 ---
 
@@ -277,4 +420,3 @@ extraction:
   classifies obvious icons/logos as `other`; tighten further with a size filter in the
   preprocessing step if needed.
 - The model must support `max_completion_tokens` and (for `analyze_images`) vision.
-```

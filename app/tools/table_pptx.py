@@ -171,6 +171,14 @@ def _add_text_box(slide, text: str, left, top, width, height) -> None:
             run.font.size = Pt(12)
 
 
+def _add_body_slide(prs: Presentation, blank_layout, title: str, content: str) -> None:
+    slide = prs.slides.add_slide(blank_layout)
+    _add_title(slide, title)
+    body = content.strip()
+    if body:
+        _add_text_box(slide, body, MARGIN, CONTENT_TOP, SLIDE_W - MARGIN * 2, CONTENT_H)
+
+
 def _rows_per_slide(available_h, font_pt: float) -> int:
     rh = Inches(font_pt / 72 * 1.8)   # approx row height from font size
     return max(1, int(available_h / rh) - 1)  # -1 for header
@@ -416,6 +424,43 @@ def build_tables_pptx(tables: list[dict]) -> bytes:
             table.get("layout", "table_only"),
             table.get("table_ratio", 0.5),
         )
+
+    buf = io.BytesIO()
+    prs.save(buf)
+    return buf.getvalue()
+
+
+def build_plan_pptx(ppt_plan: dict | None, tables: list[dict]) -> bytes:
+    """Render the full slide plan, preserving non-table slides."""
+    if not ppt_plan or not ppt_plan.get("slides"):
+        return build_tables_pptx(tables)
+
+    table_by_id = {str(table.get("table_id") or table.get("name")): table for table in tables}
+    prs = Presentation()
+    prs.slide_width = SLIDE_W
+    prs.slide_height = SLIDE_H
+    blank_layout = prs.slide_layouts[6]
+
+    for index, slide_plan in enumerate(ppt_plan.get("slides", []), 1):
+        title = str(slide_plan.get("title") or f"Slide {index}")
+        content = str(slide_plan.get("content") or "")
+        table_ref = slide_plan.get("table_ref")
+        table = table_by_id.get(str(table_ref)) if table_ref else None
+
+        if table and table.get("headers") and table.get("rows"):
+            text = content or str(table.get("text") or table.get("summary") or "")
+            _add_table_slides(
+                prs,
+                blank_layout,
+                title,
+                [str(header) for header in table["headers"]],
+                [[str(cell) for cell in row] for row in table["rows"]],
+                text,
+                "table_bottom" if text else "table_only",
+                0.68,
+            )
+        else:
+            _add_body_slide(prs, blank_layout, title, content)
 
     buf = io.BytesIO()
     prs.save(buf)

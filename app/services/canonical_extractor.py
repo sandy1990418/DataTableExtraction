@@ -24,7 +24,16 @@ def _strip_fences(text: str) -> str:
     return text.strip()
 
 
-def _evidence_to_prompt(items: list[EvidenceItem], content_limit: int = 4000) -> str:
+def _evidence_content_limit(item: EvidenceItem, default_limit: int) -> int:
+    title = item.title.lower()
+    if title.startswith(("table ", "figure ", "fig.")):
+        return 5000
+    if any(keyword in title for keyword in ("result", "experiment", "evaluation", "benchmark")):
+        return 3000
+    return default_limit
+
+
+def _evidence_to_prompt(items: list[EvidenceItem], content_limit: int = 1400) -> str:
     parts = [summarize_evidence(items), "", "Full evidence details:", ""]
     for i, item in enumerate(items, 1):
         parts.append(f"### Evidence {i}: [{item.kind}] {item.title}")
@@ -36,18 +45,135 @@ def _evidence_to_prompt(items: list[EvidenceItem], content_limit: int = 4000) ->
             if len(item.rows) > 40:
                 parts.append(f"  ... ({len(item.rows) - 40} more rows)")
         else:
-            text = item.content[:content_limit]
-            if len(item.content) > content_limit:
+            limit = _evidence_content_limit(item, content_limit)
+            text = item.content[:limit]
+            if len(item.content) > limit:
                 text += " …[truncated]"
             parts.append(f"Content: {text}")
         parts.append("")
     return "\n".join(parts)
 
 
-def _evidence_overview(items: list[EvidenceItem]) -> str:
-    """Lighter view used for planning: titles, sources, and table catalogs only."""
-    parts = [summarize_evidence(items)]
+def _planning_evidence_to_prompt(
+    items: list[EvidenceItem],
+    max_items: int = 28,
+    max_chars: int = 60000,
+) -> str:
+    """Table-aware evidence view used for schema planning.
+
+    Stage 1 is where the table grain is decided. A title-only overview makes the
+    model invent generic schemas, so planning gets the most table/metric/method
+    heavy snippets with their actual row-like text preserved.
+    """
+    parts = [
+        summarize_evidence(items),
+        "",
+        "Detailed evidence for table planning:",
+        "",
+    ]
+
+    scored = sorted(
+        ((_planning_score_item(item), index, item) for index, item in enumerate(items)),
+        key=lambda entry: (-entry[0], entry[1]),
+    )
+    selected = [item for score, _, item in scored if score > 0][:max_items]
+    if len(selected) < min(8, len(items)):
+        selected.extend(item for _, _, item in scored if item not in selected)
+        selected = selected[:max_items]
+
+    char_count = sum(len(part) for part in parts)
+    for item_index, item in enumerate(selected, 1):
+        block = _format_planning_item(item_index, item)
+        if char_count + len(block) > max_chars:
+            break
+        parts.append(block)
+        char_count += len(block)
+
     return "\n".join(parts)
+
+
+def _planning_score_item(item: EvidenceItem) -> float:
+    title = item.title.lower()
+    content = item.content.lower()
+    score = 0.0
+
+    if item.kind in {"markdown_table", "image_table"}:
+        score += 14
+    if title.startswith("table "):
+        score += 14
+    if title.startswith(("figure ", "fig.")):
+        score += 4
+    if any(
+        keyword in title or keyword in content[:1000]
+        for keyword in (
+            "benchmark",
+            "dataset",
+            "metric",
+            "metrics",
+            "accuracy",
+            "f1",
+            "bleu",
+            "rouge",
+            "meteor",
+            "sbert",
+            "result",
+            "results",
+            "evaluation",
+            "experiment",
+            "ablation",
+            "efficiency",
+            "retrieval time",
+        )
+    ):
+        score += 5
+    if any(
+        keyword in title or keyword in content[:1000]
+        for keyword in (
+            "architecture",
+            "methodology",
+            "method",
+            "memory",
+            "storage",
+            "retrieval",
+            "update",
+            "evolution",
+        )
+    ):
+        score += 3
+    if not item.content.strip() and not item.rows:
+        return 0
+    return score
+
+
+def _format_planning_item(index: int, item: EvidenceItem) -> str:
+    lines = [f"### Evidence {index}: [{item.kind}] {item.title}", f"Source: {item.source_ref}"]
+    if item.headers:
+        lines.append(f"Headers: {', '.join(item.headers)}")
+        for row in item.rows[:40]:
+            lines.append(f"  Row: {', '.join(str(c) for c in row)}")
+        if len(item.rows) > 40:
+            lines.append(f"  ... ({len(item.rows) - 40} more rows)")
+    else:
+        limit = _planning_content_limit(item)
+        text = item.content[:limit]
+        if len(item.content) > limit:
+            text += " ...[truncated]"
+        lines.append(f"Content: {text}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _planning_content_limit(item: EvidenceItem) -> int:
+    title = item.title.lower()
+    if title.startswith("table "):
+        return 5000
+    if title.startswith(("figure ", "fig.")):
+        return 2200
+    if any(keyword in title for keyword in ("result", "experiment", "evaluation", "benchmark")):
+        return 2600
+    if any(keyword in title for keyword in ("method", "architecture", "memory", "retrieval")):
+        return 1800
+    return 1200
 
 
 async def _discover_table_plan(
@@ -56,7 +182,7 @@ async def _discover_table_plan(
     settings: Settings,
     hint: str,
 ) -> list[dict[str, Any]]:
-    prompt = _evidence_overview(items)
+    prompt = _planning_evidence_to_prompt(items)
     if hint:
         prompt = f"Report goal: {hint}\n\n{prompt}"
 
@@ -99,10 +225,16 @@ def _spec_to_prompt(spec: dict[str, Any], evidence_block: str) -> str:
     )
 
 
+def _evidence_for_spec(spec: dict[str, Any], evidence_block: str | dict[str, str]) -> str:
+    if isinstance(evidence_block, dict):
+        return evidence_block.get(str(spec.get("name")), "") or evidence_block.get("", "")
+    return evidence_block
+
+
 async def _populate_table(
     client: AsyncOpenAI,
     spec: dict[str, Any],
-    evidence_block: str,
+    evidence_block: str | dict[str, str],
     settings: Settings,
 ) -> dict[str, Any] | None:
     headers = [c.get("name", "") for c in spec.get("columns", [])]
@@ -114,7 +246,7 @@ async def _populate_table(
             model=settings.OPENAI_MODEL,
             messages=[
                 {"role": "system", "content": POPULATE_SYSTEM},
-                {"role": "user", "content": _spec_to_prompt(spec, evidence_block)},
+                {"role": "user", "content": _spec_to_prompt(spec, _evidence_for_spec(spec, evidence_block))},
             ],
             max_completion_tokens=settings.MAX_TOKENS,
             temperature=settings.TEMPERATURE,
@@ -172,7 +304,7 @@ async def plan_tables(
 
 async def populate_tables(
     specs: list[dict[str, Any]],
-    evidence_block: str,
+    evidence_block: str | dict[str, str],
     settings: Settings,
 ) -> list[dict[str, Any]]:
     """Stage 2 (expensive): fill the given specs with rows from the evidence, in
