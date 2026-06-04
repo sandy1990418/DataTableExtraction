@@ -13,8 +13,22 @@ from app.prompts import PPT_PLANNER_SYSTEM
 logger = logging.getLogger(__name__)
 
 
+def _catalog_entry(t: dict) -> dict:
+    """Lightweight table descriptor for outline selection. Accepts either a plan
+    spec (with `columns`) or a populated table (with `headers`/`rows`)."""
+    entry = {"name": t.get("name"), "title": t.get("title"), "description": t.get("description")}
+    columns = t.get("columns")
+    if columns:
+        entry["columns"] = [c.get("name") if isinstance(c, dict) else c for c in columns]
+    elif t.get("headers"):
+        entry["columns"] = t["headers"]
+    if t.get("rows"):
+        entry["row_count"] = len(t["rows"])
+    return entry
+
+
 async def generate_ppt_plan(
-    canonical_tables: list[dict],
+    table_catalog: list[dict],
     evidence_summary: str,
     settings: Settings,
     presentation_hint: str = "",
@@ -26,17 +40,9 @@ async def generate_ppt_plan(
     )
 
     # Only the lightweight catalog is sent at outline time — no rows. The model
-    # picks which tables deserve a slide; full rows are pulled later at render.
+    # picks which tables deserve a slide via table_ref; rows are filled later.
     table_summary = json.dumps(
-        [
-            {
-                "name": t.get("name"),
-                "title": t.get("title"),
-                "description": t.get("description"),
-                "row_count": len(t.get("rows", [])),
-            }
-            for t in canonical_tables
-        ],
+        [_catalog_entry(t) for t in table_catalog],
         ensure_ascii=False,
         indent=2,
     )

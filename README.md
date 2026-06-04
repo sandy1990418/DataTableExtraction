@@ -46,16 +46,21 @@ table with example-anchored values. This yields tables a human would actually bu
 app/
 ├── main.py                       FastAPI app factory; wires routers
 ├── config.py                     Settings (loads .env relative to project root)
+├── models/                       ← ALL data definitions live here
+│   ├── documents.py              dataclasses: TextSection, MarkdownTable, ImageRef, ParsedDocument
+│   ├── evidence.py               dataclass: EvidenceItem (+ EvidenceKind)
+│   └── schemas.py                Pydantic API request bodies (DocumentInput, *Request, ChatRequest)
 ├── prompts/                      ← ALL system prompts live here, one module per stage
 │   ├── chat.py                   SYSTEM_PROMPT          (/chat assistant)
 │   ├── image.py                  IMAGE_SYSTEM           (vision analysis)
 │   ├── canonical.py              PLAN_SYSTEM, POPULATE_SYSTEM  (two-stage extraction)
 │   └── planner.py                PPT_PLANNER_SYSTEM     (slide outline)
-├── routes/
+├── routes/                       ← thin: route definitions only, no business logic
 │   ├── analyze.py                /evidence · /outline · /render · /analyze
 │   ├── chat.py                   /chat
 │   └── download.py               /download/{token}
 ├── services/
+│   ├── pipeline.py               orchestration shared by the analyze routes
 │   ├── document_parser.py        markdown → text sections, tables, image refs (+base64)
 │   ├── image_analysis.py         vision API per image (parallel)
 │   ├── evidence_layer.py         unify everything into typed EvidenceItems
@@ -67,6 +72,8 @@ app/
 └── tools/
     └── table_pptx.py             PPTX builder + download-token store
 ```
+
+Layering: **routes** (HTTP only) → **services/pipeline** (orchestration) → **services/\*** (single-stage logic) → **models** (data) + **prompts** (LLM instructions). Dependencies point downward; `models` and `prompts` import nothing from the app.
 
 ---
 

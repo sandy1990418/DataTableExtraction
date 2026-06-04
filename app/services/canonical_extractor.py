@@ -9,8 +9,9 @@ from typing import Any
 from openai import AsyncOpenAI
 
 from app.config import Settings
+from app.models import EvidenceItem
 from app.prompts import PLAN_SYSTEM, POPULATE_SYSTEM
-from app.services.evidence_layer import EvidenceItem, summarize_evidence
+from app.services.evidence_layer import summarize_evidence
 
 logger = logging.getLogger(__name__)
 
@@ -144,30 +145,54 @@ async def _populate_table(
     }
 
 
+def _client(settings: Settings) -> AsyncOpenAI:
+    return AsyncOpenAI(api_key=settings.OPENAI_API_KEY, base_url=settings.OPENAI_BASE_URL or None)
+
+
+# ── Public two-stage API (call separately for lazy population) ────────────────
+
+
+async def plan_tables(
+    items: list[EvidenceItem],
+    settings: Settings,
+    hint: str = "",
+) -> tuple[list[dict[str, Any]], str]:
+    """Stage 1 (cheap): discover table specs (facets) from the evidence.
+
+    Returns (specs, evidence_block). `evidence_block` is the full rendered evidence
+    that populate_tables needs later — cache it so population can run lazily without
+    re-rendering. No rows are produced here.
+    """
+    if not items:
+        return [], ""
+    specs = await _discover_table_plan(_client(settings), items, settings, hint)
+    evidence_block = _evidence_to_prompt(items)
+    return specs, evidence_block
+
+
+async def populate_tables(
+    specs: list[dict[str, Any]],
+    evidence_block: str,
+    settings: Settings,
+) -> list[dict[str, Any]]:
+    """Stage 2 (expensive): fill the given specs with rows from the evidence, in
+    parallel. Call this ONLY for the tables you actually need."""
+    if not specs:
+        return []
+    client = _client(settings)
+    populated = await asyncio.gather(
+        *[_populate_table(client, spec, evidence_block, settings) for spec in specs]
+    )
+    return [t for t in populated if t]
+
+
 async def extract_canonical_tables(
     items: list[EvidenceItem],
     settings: Settings,
     hint: str = "",
 ) -> list[dict[str, Any]]:
-    """Two-stage extraction: discover the table plan (facets), then populate each
-    table from the full evidence. This produces human-meaningful comparison tables
-    instead of generic one-shot output."""
-    if not items:
-        return []
-
-    client = AsyncOpenAI(
-        api_key=settings.OPENAI_API_KEY,
-        base_url=settings.OPENAI_BASE_URL or None,
-    )
-
-    # Stage 1: plan
-    plan = await _discover_table_plan(client, items, settings, hint)
-    if not plan:
-        return []
-
-    # Stage 2: populate each planned table in parallel against the full evidence
-    evidence_block = _evidence_to_prompt(items)
-    populated = await asyncio.gather(
-        *[_populate_table(client, spec, evidence_block, settings) for spec in plan]
-    )
-    return [t for t in populated if t]
+    """Eager two-stage extraction: plan + populate ALL tables. Prefer the lazy path
+    (plan_tables then populate_tables for only referenced tables) when you don't need
+    every table rendered."""
+    specs, evidence_block = await plan_tables(items, settings, hint)
+    return await populate_tables(specs, evidence_block, settings)
