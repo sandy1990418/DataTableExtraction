@@ -7,17 +7,9 @@ import logging
 from openai import AsyncOpenAI
 
 from app.config import Settings
+from app.prompts import IMAGE_SYSTEM
 
 logger = logging.getLogger(__name__)
-
-IMAGE_SYSTEM = """You are a visual data extraction assistant. Analyze the provided image and return a JSON object with these fields:
-- "type": one of "table", "chart", "diagram", "screenshot", "other"
-- "title": short descriptive title
-- "caption": 1-2 sentence description of what this image shows
-- "insight": key insight or finding (for charts/diagrams), or empty string
-- "table": if type is "table" or "screenshot" containing a table, include {"headers": [...], "rows": [[...], ...]}, otherwise null
-
-Return only valid JSON, no markdown fences."""
 
 
 async def analyze_image(data_b64: str, alt: str, settings: Settings) -> dict:

@@ -13,6 +13,7 @@ from app.services.document_parser import parse_markdown
 from app.services.evidence_layer import build_evidence_layer, summarize_evidence
 from app.services.image_analysis import analyze_images_batch
 from app.services.ppt_planner import generate_ppt_plan
+from app.services.session_store import get_session, store_session
 from app.tools.table_pptx import build_tables_pptx, evict_expired, store_pptx
 
 logger = logging.getLogger(__name__)
@@ -29,21 +30,7 @@ class DocumentInput(BaseModel):
     base_dir: str | None = Field(default=None, description="Base directory for resolving image paths; defaults to file_path's parent")
 
 
-class TableModel(BaseModel):
-    name: str
-    title: str = ""
-    description: str = ""
-    headers: list[str] = Field(default_factory=list)
-    rows: list[list[str]] = Field(default_factory=list)
-
-
-# ── Stage 1: evidence + table pool ───────────────────────────────────────────
-
-
-class EvidenceRequest(BaseModel):
-    documents: list[DocumentInput] = Field(description="One or more markdown documents")
-    hint: str = Field(default="", description="Optional goal that steers which tables get extracted")
-    analyze_images: bool = Field(default=True, description="Run vision analysis on embedded images")
+# ── Shared pipeline steps (used by both the staged endpoints and /analyze) ────
 
 
 def _resolve_documents(documents: list[DocumentInput]):
@@ -92,73 +79,23 @@ async def _build_evidence(parsed_docs, settings: Settings, analyze_images: bool)
     return build_evidence_layer(parsed_docs, image_analysis_map)
 
 
-@router.post("/evidence", summary="Documents → evidence layer + canonical table pool (no rendering)")
-async def evidence_endpoint(body: EvidenceRequest, settings: Settings = Depends(get_settings)):
-    """Stage 1 — run ONCE per document set and cache the result. Returns the full
-    table pool plus a lightweight catalog you feed to the outline step."""
-    parsed_docs = _resolve_documents(body.documents)
-    evidence_items = await _build_evidence(parsed_docs, settings, body.analyze_images)
-    evidence_summary = summarize_evidence(evidence_items)
-    canonical_tables = await extract_canonical_tables(evidence_items, settings, hint=body.hint)
-
-    return {
-        "evidence_summary": evidence_summary,
-        # Full tables (with rows) — cache these for the render step.
-        "tables": canonical_tables,
-        # Lightweight catalog — pass THIS to the outline step (no rows).
-        "table_catalog": [
-            {
-                "name": t.get("name"),
-                "title": t.get("title"),
-                "description": t.get("description", ""),
-                "row_count": len(t.get("rows", [])),
-                "column_count": len(t.get("headers", [])),
-            }
-            for t in canonical_tables
-        ],
-    }
+def _table_catalog(tables: list[dict]) -> list[dict]:
+    """Lightweight view (no rows) for outline-time table selection."""
+    return [
+        {
+            "name": t.get("name"),
+            "title": t.get("title"),
+            "description": t.get("description", ""),
+            "row_count": len(t.get("rows", [])),
+            "column_count": len(t.get("headers", [])),
+        }
+        for t in tables
+    ]
 
 
-# ── Stage 2: outline (which tables become slides) ────────────────────────────
-
-
-class OutlineRequest(BaseModel):
-    tables: list[TableModel] = Field(description="Table pool from /evidence (rows optional here)")
-    evidence_summary: str = Field(default="", description="evidence_summary from /evidence")
-    hint: str = Field(default="", description="Presentation goal")
-    n_slides: int | None = Field(default=None, description="Target slide count")
-
-
-@router.post("/outline", summary="Table pool → slide outline; LLM picks which tables deserve a slide")
-async def outline_endpoint(body: OutlineRequest, settings: Settings = Depends(get_settings)):
-    """Stage 2 — maps to Presenton's outline generation. Each slide may carry a
-    table_ref (a table name) or null. Tables not referenced won't be rendered."""
-    table_dicts = [t.model_dump() for t in body.tables]
-    ppt_plan = await generate_ppt_plan(
-        table_dicts,
-        body.evidence_summary,
-        settings,
-        presentation_hint=body.hint,
-        n_slides=body.n_slides,
-    )
-    referenced = [s.get("table_ref") for s in ppt_plan.get("slides", []) if s.get("table_ref")]
-    return {
-        "ppt_plan": ppt_plan,
-        "referenced_tables": referenced,
-    }
-
-
-# ── Stage 3: render (only referenced tables) ─────────────────────────────────
-
-
-class RenderRequest(BaseModel):
-    ppt_plan: dict = Field(description="Plan from /outline")
-    tables: list[TableModel] = Field(description="Full table pool from /evidence (must include rows)")
-    presentation_title: str | None = Field(default=None)
-
-
-def _select_referenced_tables(ppt_plan: dict, tables: list[TableModel]) -> list[dict]:
-    by_name = {t.name: t for t in tables}
+def _select_referenced_tables(ppt_plan: dict, tables: list[dict]) -> list[dict]:
+    """Build pptx table dicts for ONLY the tables a slide references, in slide order."""
+    by_name = {t.get("name"): t for t in tables}
     selected: list[dict] = []
     seen: set[str] = set()
     for slide in ppt_plan.get("slides", []):
@@ -166,48 +103,126 @@ def _select_referenced_tables(ppt_plan: dict, tables: list[TableModel]) -> list[
         if not ref or ref in seen or ref not in by_name:
             continue
         t = by_name[ref]
-        if not t.headers or not t.rows:
+        if not t.get("headers") or not t.get("rows"):
             continue
         seen.add(ref)
         selected.append(
             {
-                "title": t.title or t.name,
+                "title": t.get("title") or t.get("name", "Table"),
                 "kind": "extracted_summary",
-                "headers": t.headers,
-                "rows": t.rows,
-                "text": t.description,
-                "layout": "table_only" if not t.description else "text_above",
+                "headers": t.get("headers", []),
+                "rows": t.get("rows", []),
+                "text": t.get("description", ""),
+                "layout": "table_only" if not t.get("description") else "text_above",
                 "table_ratio": 0.6,
-                "summary": t.description,
+                "summary": t.get("description", ""),
                 "source_ref": "",
-                "table_id": t.name,
+                "table_id": t.get("name", ""),
             }
         )
     return selected
 
 
-@router.post("/render", summary="Plan + table pool → PPTX; renders ONLY tables referenced by the plan")
-async def render_endpoint(body: RenderRequest, settings: Settings = Depends(get_settings)):
-    """Stage 3 — maps to Presenton's per-slide content + export. Only tables whose
-    name appears in a slide's table_ref are rendered; the rest stay in the pool."""
-    pptx_tables = _select_referenced_tables(body.ppt_plan, body.tables)
+def _render_pptx(pptx_tables: list[dict], title: str, settings: Settings) -> dict:
     if not pptx_tables:
         return {"type": "text", "message": "No tables were referenced by the plan — nothing to render."}
-
     try:
-        pptx_bytes = await asyncio.to_thread(build_tables_pptx, pptx_tables)
+        pptx_bytes = build_tables_pptx(pptx_tables)
     except Exception as exc:
         logger.error("build_tables_pptx failed: %s", exc, exc_info=True)
         return {"type": "error", "message": f"PPTX generation failed: {exc}"}
-
     evict_expired()
-    title = body.presentation_title or body.ppt_plan.get("presentation_title") or "Presentation"
     filename = f"{title}.pptx"
     token = store_pptx(pptx_bytes, filename, settings.DOWNLOAD_TTL_SECONDS)
     return {"type": "download", "url": f"/download/{token}", "filename": filename}
 
 
-# ── Convenience: all-in-one (chains the three stages) ─────────────────────────
+# ── Stage 1: /evidence — parse + extract tables, cache, return session_id ─────
+
+
+class EvidenceRequest(BaseModel):
+    documents: list[DocumentInput] = Field(description="One or more markdown documents")
+    hint: str = Field(default="", description="Optional goal that steers which tables get extracted")
+    analyze_images: bool = Field(default=True, description="Run vision analysis on embedded images")
+
+
+@router.post("/evidence", summary="Documents → evidence + canonical table pool; cached under a session_id")
+async def evidence_endpoint(body: EvidenceRequest, settings: Settings = Depends(get_settings)):
+    """Stage 1 — run ONCE per document set. The full table pool is cached server-side;
+    you get back a session_id to hand to /outline and /render."""
+    parsed_docs = _resolve_documents(body.documents)
+    evidence_items = await _build_evidence(parsed_docs, settings, body.analyze_images)
+    evidence_summary = summarize_evidence(evidence_items)
+    canonical_tables = await extract_canonical_tables(evidence_items, settings, hint=body.hint)
+
+    session_id = store_session(
+        {
+            "evidence_summary": evidence_summary,
+            "tables": canonical_tables,
+            "hint": body.hint,
+        },
+        settings.SESSION_TTL_SECONDS,
+    )
+
+    return {
+        "session_id": session_id,
+        "evidence_summary": evidence_summary,
+        "table_catalog": _table_catalog(canonical_tables),
+    }
+
+
+# ── Stage 2: /outline — session_id → slide plan ──────────────────────────────
+
+
+class OutlineRequest(BaseModel):
+    session_id: str = Field(description="session_id from /evidence")
+    hint: str = Field(default="", description="Presentation goal; defaults to the /evidence hint")
+    n_slides: int | None = Field(default=None, description="Target slide count")
+
+
+@router.post("/outline", summary="session_id → slide outline; LLM picks which tables deserve a slide")
+async def outline_endpoint(body: OutlineRequest, settings: Settings = Depends(get_settings)):
+    """Stage 2 — maps to Presenton's outline generation. Reads the FULL cached tables
+    (so the planner sees real row counts). Each slide carries table_ref (a table name)
+    or null; unreferenced tables won't be rendered."""
+    session = get_session(body.session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Unknown or expired session_id; call /evidence first.")
+
+    ppt_plan = await generate_ppt_plan(
+        session["tables"],
+        session["evidence_summary"],
+        settings,
+        presentation_hint=body.hint or session.get("hint", ""),
+        n_slides=body.n_slides,
+    )
+    referenced = [s.get("table_ref") for s in ppt_plan.get("slides", []) if s.get("table_ref")]
+    return {"ppt_plan": ppt_plan, "referenced_tables": referenced}
+
+
+# ── Stage 3: /render — session_id + plan → PPTX (only referenced tables) ──────
+
+
+class RenderRequest(BaseModel):
+    session_id: str = Field(description="session_id from /evidence")
+    ppt_plan: dict = Field(description="Plan from /outline")
+    presentation_title: str | None = Field(default=None)
+
+
+@router.post("/render", summary="session_id + plan → PPTX; renders ONLY tables referenced by the plan")
+async def render_endpoint(body: RenderRequest, settings: Settings = Depends(get_settings)):
+    """Stage 3 — maps to Presenton's per-slide content + export. Pulls full rows from
+    the cached session for tables whose name appears in a slide's table_ref."""
+    session = get_session(body.session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Unknown or expired session_id; call /evidence first.")
+
+    pptx_tables = _select_referenced_tables(body.ppt_plan, session["tables"])
+    title = body.presentation_title or body.ppt_plan.get("presentation_title") or "Presentation"
+    return await asyncio.to_thread(_render_pptx, pptx_tables, title, settings)
+
+
+# ── Convenience: /analyze — all-in-one (recommended for simple use) ──────────
 
 
 class AnalyzeRequest(BaseModel):
@@ -217,7 +232,7 @@ class AnalyzeRequest(BaseModel):
     analyze_images: bool = Field(default=True)
 
 
-@router.post("/analyze", summary="All-in-one: documents → evidence → tables → outline → PPTX (renders only referenced tables)")
+@router.post("/analyze", summary="All-in-one: documents → evidence → tables → outline → PPTX")
 async def analyze_endpoint(body: AnalyzeRequest, settings: Settings = Depends(get_settings)):
     parsed_docs = _resolve_documents(body.documents)
     evidence_items = await _build_evidence(parsed_docs, settings, body.analyze_images)
@@ -229,41 +244,16 @@ async def analyze_endpoint(body: AnalyzeRequest, settings: Settings = Depends(ge
         presentation_hint=body.hint, n_slides=body.n_slides,
     )
 
-    table_models = [TableModel(**t) for t in canonical_tables]
-    pptx_tables = _select_referenced_tables(ppt_plan, table_models)
+    pptx_tables = _select_referenced_tables(ppt_plan, canonical_tables)
+    title = ppt_plan.get("presentation_title") or (canonical_tables[0].get("title") if canonical_tables else "Analysis")
+    result = await asyncio.to_thread(_render_pptx, pptx_tables, title, settings)
 
-    if not pptx_tables:
-        return {
-            "type": "text",
-            "message": "No tables were referenced by the plan.",
-            "evidence_summary": evidence_summary,
+    result.update(
+        {
             "ppt_plan": ppt_plan,
-            "table_catalog": [
-                {"name": t.get("name"), "title": t.get("title"), "rows": len(t.get("rows", []))}
-                for t in canonical_tables
-            ],
+            "rendered_tables": [t["table_id"] for t in pptx_tables],
+            "table_catalog": _table_catalog(canonical_tables),
+            "evidence_summary": evidence_summary,
         }
-
-    try:
-        pptx_bytes = await asyncio.to_thread(build_tables_pptx, pptx_tables)
-    except Exception as exc:
-        logger.error("build_tables_pptx failed: %s", exc, exc_info=True)
-        return {"type": "error", "message": f"PPTX generation failed: {exc}"}
-
-    evict_expired()
-    presentation_title = ppt_plan.get("presentation_title") or canonical_tables[0].get("title", "Analysis")
-    filename = f"{presentation_title}.pptx"
-    token = store_pptx(pptx_bytes, filename, settings.DOWNLOAD_TTL_SECONDS)
-
-    return {
-        "type": "download",
-        "url": f"/download/{token}",
-        "filename": filename,
-        "ppt_plan": ppt_plan,
-        "rendered_tables": [t["table_id"] for t in pptx_tables],
-        "table_catalog": [
-            {"name": t.get("name"), "title": t.get("title"), "rows": len(t.get("rows", []))}
-            for t in canonical_tables
-        ],
-        "evidence_summary": evidence_summary,
-    }
+    )
+    return result

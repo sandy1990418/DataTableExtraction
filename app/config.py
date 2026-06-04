@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv("../.env")
+# Load .env from the project root (DataTableExtraction/), resolved relative to this
+# file so it works regardless of the process's current working directory.
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(_PROJECT_ROOT / ".env")
 
 
 class Settings:
@@ -15,6 +19,7 @@ class Settings:
         self.MAX_TOKENS: int = int(os.getenv("MAX_TOKENS", "4096"))
         self.TEMPERATURE: float = float(os.getenv("TEMPERATURE", "0.3"))
         self.DOWNLOAD_TTL_SECONDS: int = int(os.getenv("DOWNLOAD_TTL_SECONDS", "600"))
+        self.SESSION_TTL_SECONDS: int = int(os.getenv("SESSION_TTL_SECONDS", "1800"))
 
 
 _settings: Settings | None = None
