@@ -158,10 +158,14 @@ generated outline references.
   "filename": "Comparing ... .pptx",
   "ppt_plan": { "presentation_title": "...", "slides": [] },
   "rendered_tables": ["architecture_comparison", "benchmark_results"],
-  "table_catalog": [ {"name": "...", "title": "...", "row_count": 4, "column_count": 6} ],
+  "table_catalog": [ {"name": "...", "title": "...", "columns": ["..."], "column_count": 6} ],
   "evidence_summary": "Evidence layer: 46 items ..."
 }
 ```
+
+> **Lazy population.** Planning is cheap and runs up front; the expensive per-table row
+> population only runs for tables the outline references. A planned table that no slide
+> uses is never populated — you don't pay for it.
 
 ---
 
@@ -170,7 +174,11 @@ generated outline references.
 Run `/evidence` once, then drive outline and render separately. State is cached
 server-side under a `session_id`, so you only pass a short string between calls.
 
-#### `POST /evidence` — build the table pool (run once)
+#### `POST /evidence` — plan the tables (run once, cheap)
+
+Parses the docs, builds the evidence layer, and **plans** which tables could exist (their
+columns/facets) — but does **not** fill in rows yet. That deferred work happens at
+`/render`.
 
 ```jsonc
 // request
@@ -180,17 +188,18 @@ server-side under a `session_id`, so you only pass a short string between calls.
 {
   "session_id": "e8f2e768...",          // hand this to /outline and /render
   "evidence_summary": "...",
-  "table_catalog": [                    // lightweight: no rows
+  "table_catalog": [                    // planned tables: columns only, no rows
     {"name": "architecture_comparison", "title": "...", "description": "...",
-     "row_count": 4, "column_count": 6}
+     "columns": ["System", "Memory paradigm", "Retrieval method", "..."],
+     "column_count": 6}
   ]
 }
 ```
 
 #### `POST /outline` — pick which tables become slides
 
-Maps to Presenton's outline generation. The planner sees the **full** cached tables
-(real row counts) and selects which deserve a slide via `table_ref`.
+Maps to Presenton's outline generation. The planner sees each table's title, description,
+and **column list** and selects which deserve a slide via `table_ref`.
 
 ```jsonc
 // request
@@ -211,13 +220,14 @@ Maps to Presenton's outline generation. The planner sees the **full** cached tab
 }
 ```
 
-> **Not every table goes on a slide.** A pool of 6 tables might yield 3 `table_ref`s;
-> the rest stay in the pool, unused. Slides with `table_ref: null` are text-only.
+> **Not every table goes on a slide.** A pool of 6 planned tables might yield 3
+> `table_ref`s; the rest are never populated. Slides with `table_ref: null` are text-only.
 
-#### `POST /render` — build the PPTX
+#### `POST /render` — populate referenced tables + build the PPTX
 
-Pulls full rows from the session for tables referenced by the plan and renders them in
-slide order. Unreferenced tables are never rendered.
+This is where row population happens — **lazily**, only for the tables the plan
+references, then cached on the session (a second `/render` is instant). Unreferenced
+tables are never populated or rendered.
 
 ```jsonc
 // request
@@ -227,9 +237,8 @@ slide order. Unreferenced tables are never rendered.
 { "type": "download", "url": "/download/<token>", "filename": "....pptx" }
 ```
 
-If you render slides yourself instead of calling `/render`, the rule is the same:
-iterate `ppt_plan.slides`, and only when `table_ref` is set do you pull that table's
-full rows (from the `/evidence` response or the cached session) into the slide.
+If you render slides yourself instead of calling `/render`, the equivalent is: decide
+your `table_ref`s, then call the extractor's `populate_tables` for just those specs.
 
 ---
 

@@ -36,11 +36,11 @@ ev = post("/evidence", {
     "hint": "compare LLM long-term memory architectures: mechanism, storage, retrieval, benchmarks, limitations",
     "analyze_images": False,
 })
-print("STAGE 1  /evidence")
+print("STAGE 1  /evidence  (plan only — no rows yet)")
 print("  session_id:", ev["session_id"])
-print("  table pool:")
+print("  planned tables:")
 for t in ev["table_catalog"]:
-    print(f"    [{t['name']}] {t['title']} — {t['row_count']}x{t['column_count']}")
+    print(f"    [{t['name']}] {t['title']} — cols: {t['columns']}")
 
 # Stage 2 — outline: LLM picks which tables deserve a slide
 out = post("/outline", {"session_id": ev["session_id"], "n_slides": 7})
@@ -49,11 +49,12 @@ print("\nSTAGE 2  /outline ->", plan["presentation_title"])
 for s in plan["slides"]:
     ref = f"  -> {s['table_ref']}" if s.get("table_ref") else ""
     print(f"    {s['slide_number']}. [{s['slide_type']}] {s['title']}{ref}")
-print("  pool:", len(ev["table_catalog"]), "tables | referenced:", sorted(set(out["referenced_tables"])))
+print("  planned:", len(ev["table_catalog"]), "| referenced (only these get populated):",
+      sorted(set(out["referenced_tables"])))
 
-# Stage 3 — render only the referenced tables
+# Stage 3 — populate ONLY referenced tables, then render
 rnd = post("/render", {"session_id": ev["session_id"], "ppt_plan": plan})
-print("\nSTAGE 3  /render ->", rnd.get("type"), "|", rnd.get("filename"))
+print("\nSTAGE 3  /render (lazily populates referenced tables) ->", rnd.get("type"), "|", rnd.get("filename"))
 if rnd.get("url"):
     token = rnd["url"].split("/")[-1]
     out_path = "/tmp/test_staged.pptx"
