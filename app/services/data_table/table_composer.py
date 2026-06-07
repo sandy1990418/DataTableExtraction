@@ -12,7 +12,7 @@ from pydantic import BaseModel
 
 from app.config import Settings
 from app.models.data_table import EvidenceBlock
-from app.prompts.data_table import TABLE_COMPOSER_SYSTEM
+from app.prompts.data_table import TABLE_COMPOSER_SYSTEM, TABLE_RESULT_SUMMARY_SYSTEM
 from app.services.data_table.source_table_rows import (
     extract_source_table_candidates,
     parse_markdown_table,
@@ -392,9 +392,119 @@ def compose_long_form_from_source_tables(
     )
 
 
+RESULT_SUMMARY_HEADERS = [
+    "Method / System",
+    "Main Benchmark / Task",
+    "Representative Result",
+    "Compared Against",
+    "Key Takeaway",
+    "Limitations / Notes",
+]
+
 # LLM composer hard limits
 _LLM_MAX_ROWS = 12
 _LLM_MAX_CELLS = 60
+
+
+def _format_source_tables_for_summary(
+    evidence_store: list[EvidenceBlock],
+    allowed_ids: set[str],
+    max_tables: int = 4,
+) -> str:
+    """Format full source table markdown for the result summary LLM call."""
+    lines = []
+    count = 0
+    for b in evidence_store:
+        if b.evidence_id not in allowed_ids:
+            continue
+        if not b.table_markdown:
+            continue
+        if count >= max_tables:
+            break
+        lines.append(
+            f"[evidence_id={b.evidence_id}] {b.title or b.document_name or 'untitled'}\n"
+            f"{b.table_markdown[:1200]}"
+        )
+        count += 1
+    return "\n\n---\n\n".join(lines) or "(no source tables)"
+
+
+def _format_text_for_summary(
+    evidence_store: list[EvidenceBlock],
+    allowed_ids: set[str],
+    max_items: int = 5,
+) -> str:
+    lines = []
+    for b in evidence_store:
+        if b.evidence_id not in allowed_ids or b.table_markdown:
+            continue
+        if len(lines) >= max_items:
+            break
+        preview = (b.text or "")[:400].replace("\n", " ")
+        lines.append(f"[{b.evidence_id}] {b.title or ''}: {preview}")
+    return "\n".join(lines) or "(no text evidence)"
+
+
+async def compose_result_summary(
+    hint: str,
+    plan: DataTablePlan,
+    evidence_store: list[EvidenceBlock],
+    source_table_summaries: list[SourceTableSummary],
+    settings: Settings,
+    repair_errors: list[str] | None = None,
+) -> DraftDataTable:
+    """LLM composer for result_summary mode: one row per method/system."""
+    client = AsyncOpenAI(
+        api_key=settings.OPENAI_API_KEY,
+        base_url=settings.OPENAI_BASE_URL or None,
+    )
+
+    allowed_ids = _allowed_evidence_ids(plan, evidence_store)
+
+    repair_section = ""
+    if repair_errors:
+        repair_section = (
+            "\n\nPREVIOUS ATTEMPT HAD ERRORS — repair these issues:\n"
+            + "\n".join(f"- {e}" for e in repair_errors)
+            + "\n"
+        )
+
+    user_msg = (
+        f"User hint: {hint}\n\n"
+        f"Source tables:\n{_format_source_tables_for_summary(evidence_store, allowed_ids)}\n\n"
+        f"Text evidence:\n{_format_text_for_summary(evidence_store, allowed_ids)}"
+        f"{repair_section}\n\n"
+        "Return compact JSON only. No markdown fences."
+    )
+
+    try:
+        response = await client.chat.completions.create(
+            model=settings.OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": TABLE_RESULT_SUMMARY_SYSTEM},
+                {"role": "user", "content": user_msg},
+            ],
+            max_completion_tokens=4096,
+            temperature=0.0,
+            response_format={"type": "json_object"},
+        )
+        raw = response.choices[0].message.content or "{}"
+        data = json.loads(raw)
+        draft = _parse_draft(data, plan)
+        # ensure headers are the standard result_summary schema
+        if not draft.headers or draft.headers != RESULT_SUMMARY_HEADERS:
+            draft.headers = RESULT_SUMMARY_HEADERS
+        # cap rows
+        if len(draft.rows) > _LLM_MAX_ROWS:
+            draft.rows = draft.rows[:_LLM_MAX_ROWS]
+        return draft
+    except Exception as exc:
+        logger.warning("compose_result_summary LLM call failed: %s", exc)
+        return DraftDataTable(
+            headers=RESULT_SUMMARY_HEADERS,
+            rows=[],
+            notes=[f"Result summary composition failed: {exc}"],
+        )
 
 
 async def compose_data_table(

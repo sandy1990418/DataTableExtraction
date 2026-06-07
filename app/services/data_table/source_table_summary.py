@@ -39,6 +39,7 @@ class SourceTableSummary(BaseModel):
     title: str | None = None
     headers: list[str]
     sample_rows: list[list[str]]
+    all_row_labels: list[str] = []
     row_count: int
     numeric_column_count: int
     guessed_row_grain: RowGrain
@@ -84,6 +85,7 @@ def summarize_source_tables(evidence_store: list[EvidenceBlock]) -> list[SourceT
         sample_rows = rows[:5]
         grain = _guess_row_grain(headers, sample_rows)
         numeric_cols = _count_numeric_columns(headers, rows)
+        all_row_labels = [row[0].strip() for row in rows if row and row[0].strip()]
 
         table_idx += 1
         summaries.append(
@@ -93,6 +95,7 @@ def summarize_source_tables(evidence_store: list[EvidenceBlock]) -> list[SourceT
                 title=block.title,
                 headers=headers,
                 sample_rows=sample_rows,
+                all_row_labels=all_row_labels,
                 row_count=len(rows),
                 numeric_column_count=numeric_cols,
                 guessed_row_grain=grain,

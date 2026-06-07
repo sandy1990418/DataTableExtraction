@@ -66,71 +66,100 @@ Rules:
 """
 
 TABLE_PLANNER_SYSTEM = """\
-You are a data table planner. Given a user hint, source table summaries, and text evidence, produce a coherent plan for a data table.
+You are a data table planner. Given a user hint and source table summaries, plan a coherent comparison table.
 
-You are NOT generating the table yet. You are deciding what the table should look like.
-
-Return a JSON object with:
+Return a compact JSON object with these fields:
 - table_title: short descriptive title
-- table_purpose: one sentence explaining what this table should show
-- row_grain: what each row represents (be specific: "memory system", "base model + method pair", "dataset", etc.)
-- table_format: one of "wide" or "long" (see rules below)
-- columns: list of column objects, each with:
-  - name: column name (short, clear — see naming rules below)
-  - description: what this column contains
-  - value_type: one of string, number, boolean, date, list, unknown
-  - evidence_policy: one of source_table, text, mixed
-- evidence_decisions: list of objects, each with:
-  - evidence_id: the evidence_id from the summaries
-  - decision: one of use, maybe, exclude
-  - reason: why you made this decision
-- excluded_source_tables: list of objects, each with:
-  - table_id: the table_id from summaries
-  - evidence_id: the evidence_id
-  - reason: why this source table was excluded
-- candidate_rows: list of row label strings you considered including
-- excluded_candidate_rows: list of objects, each with:
-  - row_label: the row you decided NOT to include
-  - reason: why (e.g. "incompatible row grain", "insufficient evidence")
-- generation_policy: one of single_source_table_reconstruction, coherent_synthesis, system_summary_with_metrics
-- warnings: list of any concerns (under-specified hint, insufficient evidence, etc.)
-- reason: brief explanation of your planning decisions
+- table_purpose: one sentence explaining what the table shows
+- table_purpose_type: one of "result_summary", "raw_metric_extraction", "source_table_reconstruction", "system_comparison"
+- row_grain: what each row represents (e.g. "memory system", "method", "paper")
+- table_format: "wide" or "long"
+- columns: list of {name, description, value_type, evidence_policy}
+- evidence_decisions: list of {evidence_id, decision (use/maybe/exclude), reason}
+- excluded_source_tables: list of {table_id, evidence_id, reason}
+- candidate_rows: list of row label strings
+- excluded_candidate_rows: list of {row_label, reason}
+- generation_policy: one of "single_source_table_reconstruction", "coherent_synthesis", "system_summary_with_metrics"
+- warnings: list of concern strings
+- reason: brief explanation of decisions
 
-=== TABLE FORMAT RULES ===
+=== TABLE PURPOSE RULES (read carefully) ===
 
-Choose "wide" when ALL rows share the exact same set of metrics/benchmarks.
-Example: all rows have Single-Hop F1, Multi-Hop F1, BLEU-1 → use wide format with those as columns.
+DEFAULT to "result_summary" for broad experiment/comparison hints.
+  Examples: "compare memory experiment results", "summarize benchmark results", "which system performs best"
+  → result_summary: one row per method/system; Representative Result summarizes key numbers
 
-Choose "long" when rows come from different benchmarks, or metrics differ across rows.
-Long format uses these columns (adapt names as needed):
-  Method / System | Benchmark / Task | Metric Name | Metric Value | Setting / Model | Notes
+Use "raw_metric_extraction" ONLY when the user explicitly asks for all raw metrics or a complete table.
+  Examples: "show all metric values", "extract every number", "give me the full table"
+  → raw_metric_extraction + long format: one row per method×metric
 
-If two metrics are always reported together, use paired columns:
-  <Metric A Name> | <Metric A Value> | <Metric B Name> | <Metric B Value>
-NOT: Primary Metric 1 | Primary Metric 2
+Use "source_table_reconstruction" when the user asks to reproduce a specific table from a paper.
+  → reconstruct source table rows directly
 
-=== METRIC COLUMN NAMING RULES ===
+Use "system_comparison" when the user asks to compare specific non-metric attributes.
+  → standard synthesized comparison
 
-NEVER use vague placeholder names like:
-  "Primary Metric 1", "Primary Metric 2", "Metric 1", "Metric 2", "Score 1", "Score 2"
+=== RESULT SUMMARY COLUMNS (use when table_purpose_type = result_summary) ===
 
-Instead:
-- If you know the metric name from the evidence headers/text, use it directly:
-    "Single-Hop F1", "Multi-Hop BLEU-1", "ROUGE-L", "Accuracy"
-- If two metrics appear together consistently, name the pair:
-    "Single-Hop F1" + "Multi-Hop F1"
-- If metrics differ across rows → switch to long format instead.
+Always use these columns for result_summary:
+  Method / System | Main Benchmark / Task | Representative Result | Compared Against | Key Takeaway | Limitations / Notes
+
+Do NOT flatten individual metrics into separate rows. One row = one method/system.
 
 === ROW GRAIN RULES ===
 
-You must decide on ONE consistent row_grain. Do NOT mix rows of different grains.
-If the hint is ambiguous, infer the most useful grain and explain it.
-Exclude source tables whose row_grain is incompatible with the planned row_grain.
-Do NOT mix "base model + method" rows with "memory system" rows.
-Prefer a smaller coherent table over a large incoherent one.
+Decide ONE consistent row_grain. Do NOT mix grains.
+For result_summary: row_grain = "method / system"
+Exclude incompatible source tables (wrong grain, wrong benchmark).
 
-The first column should be the entity/label column (the row identifier).
-Only include columns answerable from the evidence.
+=== METRIC COLUMN NAMING (for non-summary modes) ===
+
+NEVER use vague names like "Primary Metric 1", "Metric 2", "Score 1".
+Use the actual metric name from the evidence: "Single-Hop F1", "ROUGE-L", "Accuracy".
+"""
+
+TABLE_RESULT_SUMMARY_SYSTEM = """\
+You are summarizing experimental results for a human reader in the style of NotebookLM.
+
+Your output is a concise comparison table: ONE ROW PER METHOD / SYSTEM.
+Do NOT produce one row per metric. Summarize multiple metrics in a single cell.
+
+Return a JSON object with:
+- headers: exactly ["Method / System", "Main Benchmark / Task", "Representative Result", "Compared Against", "Key Takeaway", "Limitations / Notes"]
+- rows: list of row objects, each with:
+  - row_label: the method or system name
+  - cells: dict mapping each header to a cell object with:
+    - value: the cell value as a string (or null)
+    - status: one of supported, not_reported, inferred
+    - evidence_id: evidence_id that supports this cell (required if status != not_reported)
+    - quote: a SHORT quote from the evidence (≤80 chars) that supports the value
+- notes: list of brief notes about the table
+
+Rules for "Representative Result":
+- Pick the most headline-worthy result: best score, average across tasks, improvement over baseline.
+- Summarize multiple related metrics in one string, e.g. "Multi-Hop F1/BLEU 27.02/20.09; Temporal F1 45.85"
+- Keep the string concise. Do NOT list every metric individually.
+- The quote must contain at least one of the key numbers.
+
+Rules for "Compared Against":
+- List the main baselines this system is compared against (comma-separated names).
+- Use status=inferred if derived from reading the table context.
+
+Rules for "Key Takeaway":
+- One sentence describing the most important finding for this system.
+- Can use status=inferred with a supporting quote.
+- Must reference the evidence; do NOT invent claims.
+
+Rules for "Limitations / Notes":
+- Brief note on caveats, model settings, or missing benchmarks.
+- Use status=not_reported if nothing relevant found.
+
+General rules:
+- One row per method/system. Do NOT split a method into multiple rows.
+- Only cite evidence_ids that were provided.
+- Quotes must be ≤80 chars and appear in the evidence text or table.
+- Do not output rows for methods with no evidence.
+- Return compact JSON. No markdown fences.
 """
 
 TABLE_COMPOSER_SYSTEM = """\
@@ -144,7 +173,7 @@ Return a JSON object with:
     - value: the cell value (string, number, boolean, or null)
     - status: one of supported, not_reported, conflicting, inferred
     - evidence_id: evidence_id of the supporting evidence (required if status=supported or inferred)
-    - quote: exact substring from the evidence that supports the value (required if status=supported or inferred)
+    - quote: short quote from evidence (≤80 chars) that supports the value
 - notes: list of any notes about the table
 
 Critical rules:
@@ -152,7 +181,7 @@ Critical rules:
 - Only produce rows with the planned row_grain. Do NOT mix row grains.
 - Only use evidence marked as use or maybe in the plan.
 - For every supported cell, you MUST provide evidence_id and quote.
-- The quote MUST be a substring or close paraphrase from the evidence text.
+- The quote MUST be a substring or close paraphrase from the evidence text (≤80 chars).
 - For numeric values, the quote MUST contain the number.
 - If a value is not found in evidence, use not_reported with null value.
 - Do NOT copy rows verbatim from source tables if they have a different row_grain than the plan.
@@ -162,7 +191,6 @@ Critical rules:
 Notes column rules:
 - Every Notes cell must have a citation (evidence_id + quote).
 - If you cannot find supporting text, use status=not_reported and null value instead.
-- Do NOT write a Notes value as "inferred" without a quote from the evidence.
 """
 
 CELL_FILL_SYSTEM = """\

@@ -17,6 +17,16 @@ from app.services.data_table.source_table_summary import SourceTableSummary
 
 logger = logging.getLogger(__name__)
 
+RESULT_SUMMARY_HEADERS = [
+    "Method / System",
+    "Main Benchmark / Task",
+    "Representative Result",
+    "Compared Against",
+    "Key Takeaway",
+    "Limitations / Notes",
+    "Sources",
+]
+
 
 class PlannedColumn(BaseModel):
     name: str
@@ -45,6 +55,12 @@ class ExcludedCandidateRow(BaseModel):
 class DataTablePlan(BaseModel):
     table_title: str
     table_purpose: str
+    table_purpose_type: Literal[
+        "result_summary",
+        "raw_metric_extraction",
+        "source_table_reconstruction",
+        "system_comparison",
+    ] = "result_summary"
     row_grain: str
     table_format: Literal["wide", "long"] = "wide"
     columns: list[PlannedColumn]
@@ -61,15 +77,19 @@ class DataTablePlan(BaseModel):
     reason: str = ""
 
 
+# Default columns for result_summary when LLM omits or returns generic columns.
+_RESULT_SUMMARY_DEFAULT_COLUMNS = [
+    PlannedColumn(name=h, description=h, value_type="string", evidence_policy="mixed")
+    for h in RESULT_SUMMARY_HEADERS
+]
+
 _FALLBACK_PLAN = DataTablePlan(
     table_title="Data Table",
     table_purpose="Compare entities from provided sources.",
+    table_purpose_type="result_summary",
     row_grain="unknown",
     table_format="wide",
-    columns=[
-        PlannedColumn(name="Entity", description="The subject being compared.", value_type="string", evidence_policy="mixed"),
-        PlannedColumn(name="Description", description="Brief description.", value_type="string", evidence_policy="text"),
-    ],
+    columns=_RESULT_SUMMARY_DEFAULT_COLUMNS,
     evidence_decisions=[],
     generation_policy="coherent_synthesis",
     reason="Fallback plan — LLM planning failed.",
@@ -177,9 +197,14 @@ def _parse_plan(data: dict) -> DataTablePlan:
     if table_format not in ("wide", "long"):
         table_format = "wide"
 
+    purpose_type = data.get("table_purpose_type", "result_summary")
+    if purpose_type not in ("result_summary", "raw_metric_extraction", "source_table_reconstruction", "system_comparison"):
+        purpose_type = "result_summary"
+
     return DataTablePlan(
         table_title=str(data.get("table_title", "Data Table")).strip() or "Data Table",
         table_purpose=str(data.get("table_purpose", "")).strip(),
+        table_purpose_type=purpose_type,  # type: ignore[arg-type]
         row_grain=str(data.get("row_grain", "unknown")).strip() or "unknown",
         table_format=table_format,  # type: ignore[arg-type]
         columns=columns if len(columns) >= 1 else _FALLBACK_PLAN.columns,
@@ -195,7 +220,7 @@ def _parse_plan(data: dict) -> DataTablePlan:
 
 async def plan_data_table(
     hint: str,
-    evidence_store: list[EvidenceBlock],
+    evidence_store: list[EvidenceBlock],  # noqa: ARG001 — kept for API consistency
     source_table_summaries: list[SourceTableSummary],
     settings: Settings,
     debug_trace: list | None = None,
