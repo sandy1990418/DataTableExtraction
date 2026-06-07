@@ -11,9 +11,11 @@ from app.config import Settings
 from app.models import EvidenceItem
 from app.services.canonical_extractor import plan_tables, populate_tables
 from app.services.evidence_selector import select_table_evidence_blocks
+from app.services.grounding import ground_table_reviews
 from app.services.table_qa import review_tables
 from app.services.table_revision import revise_tables
 from app.services.table_spec_qa import review_table_specs, revise_table_specs
+from app.services.text_match import keywords, matched_terms
 
 STOPWORDS = {
     "the",
@@ -172,7 +174,10 @@ async def _supervisor_node(state: TableReportAgentState) -> dict[str, Any]:
 
 
 async def _select_report_evidence_node(state: TableReportAgentState) -> dict[str, Any]:
-    items = select_report_evidence_items(state.get("evidence_items", []), state.get("hint", ""))
+    available = state.get("evidence_items", [])
+    hint = state.get("hint", "")
+    items = select_report_evidence_items(available, hint)
+    breakdown = report_evidence_breakdown(available, hint)
     return {
         "focused_evidence_items": items,
         "agent_trace": [
@@ -182,8 +187,11 @@ async def _select_report_evidence_node(state: TableReportAgentState) -> dict[str
                 "selected_hint_relevant_evidence",
                 {
                     "selected": len(items),
-                    "available": len(state.get("evidence_items", [])),
+                    "available": len(available),
                     "top_titles": [item.title for item in items[:8]],
+                    "query_terms": breakdown["query_terms"],
+                    "selected_evidence": breakdown["selected"],
+                    "dropped_high_value_evidence": breakdown["dropped_high_value_evidence"],
                 },
             ),
         ],
@@ -300,11 +308,16 @@ async def _populate_tables_node(state: TableReportAgentState) -> dict[str, Any]:
 
 async def _review_tables_node(state: TableReportAgentState) -> dict[str, Any]:
     reviewable = _reviewable_tables(state.get("tables", []))
+    evidence_blocks = state.get("table_evidence_blocks", {})
     reviews = await review_tables(
         reviewable,
-        state.get("table_evidence_blocks", {}),
+        evidence_blocks,
         state["settings"],
     )
+    # Deterministic grounding has teeth the LLM self-review lacks: numbers a cell
+    # claims must actually appear in that table's evidence block, or the cell is
+    # flagged and the row-revision loop is forced to re-derive it.
+    reviews = ground_table_reviews(reviewable, evidence_blocks, reviews)
     action = "reviewed_revised_rows" if state.get("row_revision_round", 0) else "reviewed_rows"
     detail = {"needs_revision": _needs_row_revision_names(reviews)}
     if state.get("row_revision_round", 0):
@@ -322,27 +335,73 @@ async def _revise_tables_node(state: TableReportAgentState) -> dict[str, Any]:
     revision_names = set(_needs_row_revision_names(state.get("qa_reviews", [])))
     reviewable = _reviewable_tables(state.get("tables", []))
     revision_tables = [table for table in reviewable if _table_id(table) in revision_names]
+
+    # Real repair action: rewriting a flagged table against the SAME (often
+    # truncated) evidence block can't recover a row/number the 40-row or char cap
+    # dropped. So re-select a WIDER block for just the flagged tables and revise
+    # against that. The expansion is fed only to revise_tables for this round —
+    # state["table_evidence_blocks"] (the grounding baseline) is left untouched.
+    base_blocks = state.get("table_evidence_blocks", {})
+    revision_blocks, expansion = _expanded_revision_blocks(state, revision_names, base_blocks)
+
     revised = await revise_tables(
         revision_tables,
         state.get("qa_reviews", []),
-        state.get("table_evidence_blocks", {}),
+        revision_blocks,
         state["settings"],
     )
     revised_by_id = {_table_id(table): _canonical_from_reviewable(table) for table in revised}
     tables = [revised_by_id.get(_table_id(table), table) for table in state.get("tables", [])]
     revision_round = state.get("row_revision_round", 0) + 1
+    detail: dict[str, Any] = {"round": revision_round, "tables": list(revised_by_id)}
+    if expansion:
+        detail["expanded_evidence"] = expansion
     return {
         "tables": tables,
         "row_revision_round": revision_round,
         "agent_trace": [
             *state.get("agent_trace", []),
-            _trace(
-                "TableRevisionAgent",
-                "revised_rows",
-                {"round": revision_round, "tables": list(revised_by_id)},
-            ),
+            _trace("TableRevisionAgent", "revised_rows", detail),
         ],
     }
+
+
+def _expanded_revision_blocks(
+    state: TableReportAgentState,
+    revision_names: set[str],
+    base_blocks: dict[str, str],
+) -> tuple[dict[str, str], list[dict[str, Any]]]:
+    """Per-table evidence blocks for revision, widened for flagged tables.
+
+    Returns (blocks_to_use, expansion_trace). When there is nothing to widen the
+    original blocks are returned unchanged, so behavior matches the prior path.
+    """
+    items = state.get("focused_evidence_items") or state.get("evidence_items") or []
+    flagged_specs = [spec for spec in state.get("specs", []) if str(spec.get("name")) in revision_names]
+    if not flagged_specs or not items:
+        return base_blocks, []
+
+    expanded = select_table_evidence_blocks(
+        flagged_specs,
+        items,
+        max_items=28,
+        max_chars=36000,
+        max_rows=120,
+    )
+    merged = dict(base_blocks)
+    expansion: list[dict[str, Any]] = []
+    for name, new_block in expanded.items():
+        old_block = base_blocks.get(name, "")
+        if len(new_block) > len(old_block):
+            merged[name] = new_block
+            expansion.append(
+                {
+                    "table_id": name,
+                    "evidence_chars_before": len(old_block),
+                    "evidence_chars_after": len(new_block),
+                }
+            )
+    return merged, expansion
 
 
 async def _build_ppt_plan_node(state: TableReportAgentState) -> dict[str, Any]:
@@ -377,24 +436,75 @@ def select_report_evidence_items(
     hint: str,
     max_items: int = 48,
 ) -> list[EvidenceItem]:
-    if not items:
-        return []
-    query_terms = _keywords(hint)
-    scored = sorted(
-        ((_score_report_item(item, query_terms), index, item) for index, item in enumerate(items)),
-        key=lambda entry: (-entry[0], entry[1]),
-    )
-    selected = [item for score, _, item in scored if score > 0][:max_items]
+    ranked = _rank_report_items(items, hint)
+    selected = [entry[2] for entry in ranked if entry[0] > 0][:max_items]
     if len(selected) < min(12, len(items)):
-        selected.extend(item for _, _, item in scored if item not in selected)
+        selected.extend(entry[2] for entry in ranked if entry[2] not in selected)
         selected = selected[:max_items]
     return selected
 
 
-def _score_report_item(item: EvidenceItem, query_terms: Counter[str]) -> float:
+def report_evidence_breakdown(
+    items: list[EvidenceItem],
+    hint: str,
+    max_items: int = 48,
+) -> dict[str, Any]:
+    """Scoring rationale for the report-evidence step, for the debug trace.
+
+    Surfaces per-item score + matched terms and any high-value (table-like) item
+    that was scored but dropped, so a failure can be traced to retrieval instead
+    of guessed at from the final PPTX.
+    """
+    ranked = _rank_report_items(items, hint)
+    selected = select_report_evidence_items(items, hint, max_items)
+    selected_ids = {id(item) for item in selected}
+
+    def entry_view(score: float, item: EvidenceItem, matched: list[str]) -> dict[str, Any]:
+        return {
+            "source_ref": item.source_ref,
+            "kind": item.kind,
+            "title": item.title,
+            "score": round(score, 2),
+            "matched_terms": matched[:8],
+            "preview": item.content[:160].replace("\n", " ").strip(),
+        }
+
+    dropped_high_value = [
+        entry_view(score, item, matched)
+        for score, _, item, matched in ranked
+        if id(item) not in selected_ids and item.kind in {"markdown_table", "image_table"}
+    ]
+    return {
+        "query_terms": list(keywords(hint, STOPWORDS))[:16],
+        "selected": [
+            entry_view(score, item, matched)
+            for score, _, item, matched in ranked
+            if id(item) in selected_ids
+        ][:max_items],
+        "dropped_high_value_evidence": dropped_high_value[:12],
+    }
+
+
+def _rank_report_items(
+    items: list[EvidenceItem],
+    hint: str,
+) -> list[tuple[float, int, EvidenceItem, list[str]]]:
+    if not items:
+        return []
+    query_terms = _keywords(hint)
+    ranked = []
+    for index, item in enumerate(items):
+        score, matched = _score_report_item(item, query_terms)
+        ranked.append((score, index, item, matched))
+    ranked.sort(key=lambda entry: (-entry[0], entry[1]))
+    return ranked
+
+
+def _score_report_item(item: EvidenceItem, query_terms: Counter[str]) -> tuple[float, list[str]]:
     item_text = f"{item.title} {item.content} {' '.join(item.headers)}"
     item_terms = _keywords(item_text)
     overlap = sum(min(count, item_terms.get(term, 0)) for term, count in query_terms.items())
+    matched = matched_terms(query_terms, item_terms)
 
     title = item.title.lower()
     content = item.content.lower()
@@ -403,20 +513,25 @@ def _score_report_item(item: EvidenceItem, query_terms: Counter[str]) -> float:
         score += 12
     if title.startswith("table "):
         score += 12
-    if any(term in title or term in content[:1000] for term in query_terms):
+    if matched:
         score += 3
-    if any(term in title or term in content[:1200] for term in ("benchmark", "metric", "result", "evaluation")):
+    if any(
+        term in title or term in content[:1200]
+        for term in ("benchmark", "metric", "result", "evaluation")
+    ):
         score += 5
-    if any(term in title or term in content[:1200] for term in ("architecture", "memory", "storage", "retrieval")):
+    if any(
+        term in title or term in content[:1200]
+        for term in ("architecture", "memory", "storage", "retrieval")
+    ):
         score += 4
     if not item.content.strip() and not item.rows:
-        return 0
-    return score
+        return 0.0, matched
+    return score, matched
 
 
 def _keywords(text: str) -> Counter[str]:
-    words = re.findall(r"[A-Za-z][A-Za-z0-9-]{2,}", text.lower())
-    return Counter(word for word in words if word not in STOPWORDS)
+    return keywords(text, STOPWORDS)
 
 
 def _route_after_spec_review(state: TableReportAgentState) -> str:
@@ -442,7 +557,9 @@ def _build_agent_ppt_plan(
     n_slides: int | None,
 ) -> dict:
     title = _presentation_title(hint)
-    table_names = [str(table.get("name") or table.get("table_id") or table.get("title")) for table in tables]
+    table_names = [
+        str(table.get("name") or table.get("table_id") or table.get("title")) for table in tables
+    ]
     specs_by_name = {str(spec.get("name")): spec for spec in specs if spec.get("name")}
 
     slides: list[dict] = [
@@ -503,7 +620,9 @@ def _presentation_title(hint: str) -> str:
     cleaned = re.sub(r"\s+", " ", hint).strip(" .")
     if not cleaned:
         return "Table Report"
-    cleaned = re.sub(r"^(make|create|generate|compare|summarize)\s+", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(
+        r"^(make|create|generate|compare|summarize)\s+", "", cleaned, flags=re.IGNORECASE
+    )
     words = cleaned.split()
     title = " ".join(word[:1].upper() + word[1:] for word in words[:10])
     return title[:90] or "Table Report"
@@ -515,7 +634,9 @@ def _overview_content(specs_by_name: dict[str, dict], table_names: list[str]) ->
     lines = []
     for name in table_names:
         spec = specs_by_name.get(name, {})
-        lines.append(f"- {spec.get('title') or name}: {spec.get('description') or 'generated table'}")
+        lines.append(
+            f"- {spec.get('title') or name}: {spec.get('description') or 'generated table'}"
+        )
     return "\n".join(lines)
 
 

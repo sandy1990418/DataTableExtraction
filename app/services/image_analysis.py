@@ -25,12 +25,17 @@ async def analyze_image(data_b64: str, alt: str, settings: Settings) -> dict:
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": f"Image alt text: {alt or 'not provided'}. Analyze this image."},
+                        {
+                            "type": "text",
+                            "text": f"Image alt text: {alt or 'not provided'}. Analyze this image.",
+                        },
                         {"type": "image_url", "image_url": {"url": data_b64}},
                     ],
                 },
             ],
-            max_completion_tokens=1024,
+            # Table screenshots can have many rows; 1024 tokens truncates the JSON
+            # mid-table and the result is silently dropped as unparseable.
+            max_completion_tokens=min(settings.MAX_TOKENS, 4096),
             temperature=0.1,
         )
         content = response.choices[0].message.content or "{}"

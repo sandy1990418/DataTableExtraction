@@ -5,11 +5,14 @@ import re
 from pathlib import Path
 
 from app.models import ImageRef, MarkdownTable, ParsedDocument, TextSection
+from app.services.table_extraction import extract_source_tables
 
 MAX_TEXT_SECTION_CHARS = 3500
 
 
-def parse_markdown(content: str, doc_name: str = "doc", base_dir: str | None = None) -> ParsedDocument:
+def parse_markdown(
+    content: str, doc_name: str = "doc", base_dir: str | None = None
+) -> ParsedDocument:
     doc = ParsedDocument(name=doc_name)
     lines = content.splitlines()
     i = 0
@@ -69,7 +72,11 @@ def parse_markdown(content: str, doc_name: str = "doc", base_dir: str | None = N
             i = j
             continue
 
-        if "|" in line and i + 1 < len(lines) and re.match(r"^[\|\s]*:?-{3,}:?[\|\s]*", lines[i + 1]):
+        if (
+            "|" in line
+            and i + 1 < len(lines)
+            and re.match(r"^[\|\s]*:?-{3,}:?[\|\s]*", lines[i + 1])
+        ):
             flush_section(i)
             headers = _split_pipe(line)
             rows: list[list[str]] = []
@@ -77,18 +84,22 @@ def parse_markdown(content: str, doc_name: str = "doc", base_dir: str | None = N
             while j < len(lines) and "|" in lines[j]:
                 rows.append(_split_pipe(lines[j]))
                 j += 1
-            doc.tables.append(MarkdownTable(
-                title=current_heading or "Table",
-                headers=headers,
-                rows=rows,
-                source_ref=f"{doc_name}:lines:{i+1}-{j}",
-            ))
+            doc.tables.append(
+                MarkdownTable(
+                    title=current_heading or "Table",
+                    headers=headers,
+                    rows=rows,
+                    source_ref=f"{doc_name}:lines:{i + 1}-{j}",
+                )
+            )
             i = j
             continue
 
         img_matches = re.findall(r"!\[([^\]]*)\]\(([^)]+)\)", line)
         for alt, path in img_matches:
-            ref = ImageRef(alt=alt.strip(), path=path.strip(), source_ref=f"{doc_name}:line:{i+1}")
+            ref = ImageRef(
+                alt=alt.strip(), path=path.strip(), source_ref=f"{doc_name}:line:{i + 1}"
+            )
             if base_dir:
                 abs_path = Path(base_dir) / path
                 if abs_path.exists():
@@ -108,7 +119,35 @@ def parse_markdown(content: str, doc_name: str = "doc", base_dir: str | None = N
         i += 1
 
     flush_section(len(lines))
+    _merge_non_pipe_tables(doc, content, doc_name)
     return doc
+
+
+def _merge_non_pipe_tables(doc: ParsedDocument, content: str, doc_name: str) -> None:
+    """Add HTML/TSV (and any other) source tables the strict pipe parser missed.
+
+    The inline scanner above only recognizes GitHub-style pipe tables. PDF→markdown
+    and scraped docs routinely carry HTML ``<table>`` or tab-separated tables, which
+    would otherwise never reach the evidence layer. ``extract_source_tables`` already
+    handles those robustly, so we reuse it and dedupe against what we already found.
+    """
+    seen = {(tuple(t.headers), tuple(tuple(r) for r in t.rows)) for t in doc.tables}
+    for table in extract_source_tables(content):
+        headers = table.get("headers") or []
+        rows = table.get("rows") or []
+        key = (tuple(headers), tuple(tuple(r) for r in rows))
+        if not headers or not rows or key in seen:
+            continue
+        seen.add(key)
+        ref = table.get("source_ref") or "source_table"
+        doc.tables.append(
+            MarkdownTable(
+                title=table.get("title") or "Table",
+                headers=headers,
+                rows=rows,
+                source_ref=f"{doc_name}:{ref}",
+            )
+        )
 
 
 def _split_pipe(line: str) -> list[str]:

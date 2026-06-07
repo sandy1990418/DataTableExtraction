@@ -23,7 +23,13 @@ from app.services.llm_service import (
     chat,
 )
 from app.services.pipeline import validate_table_quality
-from app.services.report_agent_team import run_table_report_agent_team, select_report_evidence_items
+from app.services.grounding import check_numeric_grounding, ground_table_reviews
+from app.services.report_agent_team import (
+    report_evidence_breakdown,
+    run_table_report_agent_team,
+    select_report_evidence_items,
+)
+from app.services.text_match import keywords, overlap_score
 from app.services.table_agent_team import run_table_agent_team
 from app.services.table_qa import review_tables
 from app.services.table_extraction import extract_source_tables
@@ -183,7 +189,10 @@ def test_build_plan_pptx_preserves_non_table_slides() -> None:
 
     presentation = Presentation(io.BytesIO(pptx_bytes))
     assert len(presentation.slides) == 3
-    assert [sum(1 for shape in slide.shapes if getattr(shape, "has_table", False)) for slide in presentation.slides] == [0, 1, 0]
+    assert [
+        sum(1 for shape in slide.shapes if getattr(shape, "has_table", False))
+        for slide in presentation.slides
+    ] == [0, 1, 0]
 
 
 def test_pdf_like_markdown_is_split_into_table_sections() -> None:
@@ -217,7 +226,12 @@ More prose.
 
 def test_evidence_selector_prioritizes_matching_table_sections() -> None:
     items = [
-        EvidenceItem(kind="text_fact", source_ref="paper:1", title="Introduction", content="General memory overview."),
+        EvidenceItem(
+            kind="text_fact",
+            source_ref="paper:1",
+            title="Introduction",
+            content="General memory overview.",
+        ),
         EvidenceItem(
             kind="text_fact",
             source_ref="paper:table:2",
@@ -335,7 +349,10 @@ def test_validate_table_quality_flags_sparse_and_generic_tables() -> None:
     warnings = validate_table_quality(
         [
             {"table_id": "sparse", "rows": [["-", "N/A"], ["", "-"]]},
-            {"table_id": "generic", "rows": [["Yes", "High"], ["Moderate", "Low"], ["Yes", "High"]]},
+            {
+                "table_id": "generic",
+                "rows": [["Yes", "High"], ["Moderate", "Low"], ["Yes", "High"]],
+            },
         ]
     )
 
@@ -710,8 +727,12 @@ async def test_table_report_agent_team_reviews_specs_before_population(monkeypat
         ]
 
     monkeypatch.setattr("app.services.report_agent_team.plan_tables", fake_plan_tables)
-    monkeypatch.setattr("app.services.report_agent_team.review_table_specs", fake_review_table_specs)
-    monkeypatch.setattr("app.services.report_agent_team.revise_table_specs", fake_revise_table_specs)
+    monkeypatch.setattr(
+        "app.services.report_agent_team.review_table_specs", fake_review_table_specs
+    )
+    monkeypatch.setattr(
+        "app.services.report_agent_team.revise_table_specs", fake_revise_table_specs
+    )
     monkeypatch.setattr("app.services.report_agent_team.populate_tables", fake_populate_tables)
     monkeypatch.setattr("app.services.report_agent_team.review_tables", fake_review_tables)
 
@@ -752,3 +773,97 @@ async def test_table_report_agent_team_reviews_specs_before_population(monkeypat
         "TableGroundingAgent",
         "ReportComposerAgent",
     ]
+
+
+def test_keywords_tokenizes_chinese_hint() -> None:
+    # ASCII-only tokenization dropped CJK hints entirely; the shared tokenizer
+    # must yield CJK unigrams + bigrams so overlap with CJK evidence is non-zero.
+    query = keywords("比較 ASR 錯誤率")
+    assert "asr" in query
+    assert "錯誤" in query  # bigram
+    assert "錯" in query  # unigram
+
+    evidence = keywords("各模型的語音辨識錯誤率比較 (ASR error rate)")
+    assert overlap_score(query, evidence) > 0
+
+
+def test_report_evidence_breakdown_exposes_scores_and_drops() -> None:
+    items = [
+        EvidenceItem(
+            kind="markdown_table",
+            source_ref="paper:table:1",
+            title="Table 1: Latency",
+            content="3 rows x 2 columns",
+            headers=["Model", "Latency"],
+            rows=[["A", "12ms"]],
+        ),
+        EvidenceItem(
+            kind="text_fact",
+            source_ref="paper:intro",
+            title="Introduction",
+            content="Unrelated prose.",
+        ),
+    ]
+
+    breakdown = report_evidence_breakdown(items, "latency comparison", max_items=1)
+
+    assert breakdown["query_terms"]
+    assert breakdown["selected"][0]["source_ref"] == "paper:table:1"
+    assert "score" in breakdown["selected"][0]
+    # The table that didn't make the cut is surfaced as dropped high-value evidence
+    # so a retrieval miss is visible in the trace instead of guessed at.
+    assert isinstance(breakdown["dropped_high_value_evidence"], list)
+
+
+def test_numeric_grounding_flags_fabricated_numbers() -> None:
+    table = {
+        "table_id": "metrics",
+        "headers": ["Model", "F1"],
+        "rows": [["A", "49.11"], ["B", "99.99"]],
+    }
+    evidence = "Model A reports F1 49.11 on the benchmark."
+
+    unsupported = check_numeric_grounding(table, evidence)
+
+    assert len(unsupported) == 1
+    assert unsupported[0]["number"] == "99.99"
+    assert unsupported[0]["row"] == 1
+
+
+def test_ground_table_reviews_forces_revision_on_ungrounded_cell() -> None:
+    tables = [
+        {
+            "table_id": "metrics",
+            "headers": ["Model", "F1"],
+            "rows": [["A", "12.34"]],
+        }
+    ]
+    reviews = [{"table_id": "metrics", "status": "pass", "warnings": [], "unsupported_cells": []}]
+
+    grounded = ground_table_reviews(tables, {"metrics": "no numbers here at all"}, reviews)
+
+    assert grounded[0]["status"] == "needs_revision"
+    assert grounded[0]["unsupported_cells"]
+    # Original review object is not mutated.
+    assert reviews[0]["status"] == "pass"
+
+
+def test_parser_picks_up_html_tables_missed_by_pipe_scanner() -> None:
+    doc = parse_markdown(
+        """# Results
+
+<table>
+<caption>HTML Results</caption>
+<tr><th>Model</th><th>Score</th></tr>
+<tr><td>A</td><td>0.91</td></tr>
+</table>
+""",
+        doc_name="paper",
+    )
+
+    titles = {t.title for t in doc.tables}
+    assert "HTML Results" in titles
+    html_table = next(t for t in doc.tables if t.title == "HTML Results")
+    assert html_table.headers == ["Model", "Score"]
+    assert html_table.rows == [["A", "0.91"]]
+    assert html_table.source_ref.startswith("paper:")
