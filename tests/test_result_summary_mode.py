@@ -133,6 +133,7 @@ def test_result_summary_headers_constant():
         "Compared Against",
         "Key Takeaway",
         "Limitations / Notes",
+        "Sources",
     ]
 
 

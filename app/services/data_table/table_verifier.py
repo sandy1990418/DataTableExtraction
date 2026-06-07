@@ -12,7 +12,6 @@ from app.models.data_table import (
     GroundedCell,
     GroundedRow,
     RowEntity,
-    SourceRef,
 )
 from app.services.data_table.table_composer import DraftCell, DraftDataTable
 from app.services.data_table.table_planner import DataTablePlan
@@ -24,9 +23,44 @@ _VAGUE_HEADER_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
+# Columns where the verifier also searches block.title (not just text+table)
+_CONTEXT_SUPPORT_COLS = frozenset({
+    "Main Benchmark / Task",
+    "Compared Against",
+    "Sources",
+})
+
+# Columns where inferred status is acceptable without a strict quote check
+_SOFT_COLS = frozenset({
+    "Key Takeaway",
+    "Limitations / Notes",
+})
+
+# Role lookup for result-summary column names
+_RESULT_SUMMARY_ROLES: dict[str, str] = {
+    "Method / System": "entity",
+    "Main Benchmark / Task": "attribute",
+    "Representative Result": "metric",
+    "Compared Against": "attribute",
+    "Key Takeaway": "notes",
+    "Limitations / Notes": "notes",
+    "Sources": "notes",
+}
+
 
 def _ev_text(block: EvidenceBlock) -> str:
     parts = [block.text or ""]
+    if block.table_markdown:
+        parts.append(block.table_markdown)
+    return " ".join(parts)
+
+
+def _ev_text_with_title(block: EvidenceBlock) -> str:
+    """Extended evidence text that includes block title — used for context columns."""
+    parts = []
+    if block.title:
+        parts.append(block.title)
+    parts.append(block.text or "")
     if block.table_markdown:
         parts.append(block.table_markdown)
     return " ".join(parts)
@@ -43,7 +77,6 @@ def _quote_in_evidence(quote: str, text: str) -> bool:
     t = _normalize_ws(text)
     if q in t:
         return True
-    # partial overlap: 60% of words match
     q_words = q.split()
     t_words = set(t.split())
     overlap = sum(1 for w in q_words if w in t_words)
@@ -56,6 +89,15 @@ def _numeric_in_quote(value: float | int, quote: str) -> bool:
         return any(abs(float(n) - float(value)) < 1e-4 for n in nums)
     except ValueError:
         return False
+
+
+def _any_number_from_value_in_evidence(value_str: str, ev_text: str) -> bool:
+    """For composite Representative Result cells, require at least one number in evidence."""
+    nums = _NUMERIC_RE.findall(str(value_str))
+    if not nums:
+        return True  # no numbers to verify
+    ev_nums = set(_NUMERIC_RE.findall(ev_text))
+    return any(n in ev_nums for n in nums)
 
 
 def _build_grounded_cell(
@@ -72,7 +114,16 @@ def _build_grounded_cell(
     value = draft_cell.value
 
     citations: list[CellCitation] = []
-    verification_notes: list[str] = []
+
+    # inferred cells in soft columns: accept without strict quote check
+    if status == "inferred" and col_name in _SOFT_COLS:
+        if ev_id and ev_id in evidence_index and quote:
+            citations.append(CellCitation(
+                source_ref=evidence_index[ev_id].source_ref,
+                quote=quote,
+                support_type="inferred",
+            ))
+        return GroundedCell(value=value, status=status, citations=citations, confidence=0.6)
 
     if status == "supported":
         if not ev_id:
@@ -86,7 +137,8 @@ def _build_grounded_cell(
             status = "unsupported"
         else:
             block = evidence_index[ev_id]
-            ev_text = _ev_text(block)
+            # context columns also search the block title
+            ev_text = _ev_text_with_title(block) if col_name in _CONTEXT_SUPPORT_COLS else _ev_text(block)
 
             if not quote:
                 errors.append(f"Cell {entity_name}/{col_name}: supported but no quote")
@@ -100,22 +152,40 @@ def _build_grounded_cell(
                         f"Cell {entity_name}/{col_name}: numeric value {value} not found in quote"
                     )
                     status = "unsupported"
-                else:
-                    citations.append(
-                        CellCitation(
-                            source_ref=block.source_ref,
-                            quote=quote,
-                            support_type="direct",
+                elif col_name == "Representative Result" and value is not None:
+                    # composite string — require at least one number from value in evidence
+                    full_ev = _ev_text(block)
+                    if not _any_number_from_value_in_evidence(str(value), full_ev):
+                        errors.append(
+                            f"Cell {entity_name}/{col_name}: no number from value found in evidence {ev_id}"
                         )
-                    )
+                        status = "unsupported"
+                    else:
+                        citations.append(CellCitation(
+                            source_ref=block.source_ref, quote=quote, support_type="direct"
+                        ))
+                else:
+                    citations.append(CellCitation(
+                        source_ref=block.source_ref, quote=quote, support_type="direct"
+                    ))
 
     return GroundedCell(
         value=value,
         status=status,
         citations=citations,
-        confidence=0.9 if status == "supported" else 0.0,
-        verification_notes=verification_notes,
+        confidence=0.9 if status == "supported" else (0.6 if status == "inferred" else 0.0),
     )
+
+
+def _infer_role_from_name(col_name: str) -> str:
+    if col_name in _RESULT_SUMMARY_ROLES:
+        return _RESULT_SUMMARY_ROLES[col_name]
+    lc = col_name.lower()
+    if any(w in lc for w in ("score", "f1", "bleu", "accuracy", "metric", "result", "value")):
+        return "metric"
+    if any(w in lc for w in ("note", "limitation", "source", "takeaway")):
+        return "notes"
+    return "attribute"
 
 
 def verify_draft_table(
@@ -125,8 +195,8 @@ def verify_draft_table(
 ) -> tuple[list[GroundedRow], DataTableSchema, list[str]]:
     """Verify a DraftDataTable and return (grounded_rows, schema, errors).
 
-    Errors are severe issues that should trigger a repair. Warnings are
-    appended directly to a returned list of string warnings.
+    Schema is always built from draft.headers (not plan.columns) so that the
+    composer's result_summary headers are never overwritten by the planner fallback.
     """
     evidence_index = {b.evidence_id: b for b in evidence_store}
     excluded_ids = {d.evidence_id for d in plan.evidence_decisions if d.decision == "exclude"}
@@ -134,19 +204,24 @@ def verify_draft_table(
     errors: list[str] = []
     warnings: list[str] = []
 
-    # Build schema from plan
+    # Fix 2: build schema from draft.headers, using plan metadata where names match.
+    plan_col_map = {pc.name: pc for pc in plan.columns}
+    role_map = {"string": "attribute", "number": "metric", "boolean": "attribute",
+                "date": "date", "list": "attribute", "unknown": "attribute"}
+
     columns: list[DataTableColumn] = []
-    for i, pc in enumerate(plan.columns):
-        role_map = {"string": "attribute", "number": "metric", "boolean": "attribute",
-                    "date": "date", "list": "attribute", "unknown": "attribute"}
-        role = "entity" if i == 0 else role_map.get(pc.value_type, "attribute")
-        columns.append(DataTableColumn(
-            name=pc.name,
-            role=role,
-            description=pc.description,
-            value_type=pc.value_type if pc.value_type != "unknown" else "string",
-            required=(i == 0),
-        ))
+    for i, h in enumerate(draft.headers):
+        pc = plan_col_map.get(h)
+        if pc:
+            role = "entity" if i == 0 else role_map.get(pc.value_type, "attribute")
+            vtype = pc.value_type if pc.value_type != "unknown" else "string"
+            desc = pc.description
+        else:
+            role = "entity" if i == 0 else _infer_role_from_name(h)
+            vtype = "string"
+            desc = h
+        columns.append(DataTableColumn(name=h, role=role, description=desc,
+                                       value_type=vtype, required=(i == 0)))
 
     schema = DataTableSchema(
         title=plan.table_title,
@@ -169,13 +244,9 @@ def verify_draft_table(
         for col_name in col_names:
             draft_cell = draft_row.cells.get(col_name, DraftCell(value=None, status="not_reported"))
 
-            # first column is entity column — use row_label
             if col_name == col_names[0]:
                 cells[col_name] = GroundedCell(
-                    value=entity_name,
-                    status="supported",
-                    citations=[],
-                    confidence=0.9,
+                    value=entity_name, status="supported", citations=[], confidence=0.9
                 )
                 continue
 
@@ -193,9 +264,7 @@ def verify_draft_table(
     # table-level warnings
     if rows:
         all_data_cells = [
-            cell
-            for row in rows
-            for name, cell in row.cells.items()
+            cell for row in rows for name, cell in row.cells.items()
             if name != col_names[0]
         ]
         if all_data_cells:
@@ -208,7 +277,6 @@ def verify_draft_table(
                     "Evidence may not cover the requested table."
                 )
 
-    # vague header names
     vague_headers = [h for h in col_names if _VAGUE_HEADER_PATTERNS.match(h.strip())]
     if vague_headers:
         warnings.append(
@@ -216,7 +284,6 @@ def verify_draft_table(
             "Use specific metric names (e.g. 'Single-Hop F1') or switch to long format."
         )
 
-    # row count much smaller than candidate count
     candidate_count = len(plan.candidate_rows)
     if candidate_count > 0 and len(rows) < candidate_count * 0.5:
         warnings.append(

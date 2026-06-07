@@ -18,7 +18,7 @@ from app.services.data_table.source_table_rows import (
     parse_markdown_table,
 )
 from app.services.data_table.source_table_summary import SourceTableSummary
-from app.services.data_table.table_planner import DataTablePlan
+from app.services.data_table.table_planner import RESULT_SUMMARY_HEADERS, DataTablePlan
 
 logger = logging.getLogger(__name__)
 
@@ -245,10 +245,8 @@ def _find_metric_col_indices(headers: list[str], rows: list[list[str]]) -> list[
 
 def _long_form_headers(plan: DataTablePlan) -> list[str]:
     """Return the long-form column headers, using plan columns when they match, else defaults."""
-    plan_names = {c.name.lower() for c in plan.columns}
     defaults = ["Method / System", "Benchmark / Task", "Metric Name", "Metric Value",
                  "Setting / Model", "Notes"]
-    # if plan has named these columns, use plan names in order
     if len(plan.columns) >= 4:
         return [c.name for c in plan.columns]
     return defaults
@@ -257,7 +255,7 @@ def _long_form_headers(plan: DataTablePlan) -> list[str]:
 def compose_long_form_from_source_tables(
     plan: DataTablePlan,
     evidence_store: list[EvidenceBlock],
-    source_table_summaries: list[SourceTableSummary],
+    source_table_summaries: list[SourceTableSummary],  # noqa: ARG001
 ) -> DraftDataTable | None:
     """Deterministic long-form composer: one output row per (source-row × metric-column).
 
@@ -392,15 +390,6 @@ def compose_long_form_from_source_tables(
     )
 
 
-RESULT_SUMMARY_HEADERS = [
-    "Method / System",
-    "Main Benchmark / Task",
-    "Representative Result",
-    "Compared Against",
-    "Key Takeaway",
-    "Limitations / Notes",
-]
-
 # LLM composer hard limits
 _LLM_MAX_ROWS = 12
 _LLM_MAX_CELLS = 60
@@ -449,7 +438,7 @@ async def compose_result_summary(
     hint: str,
     plan: DataTablePlan,
     evidence_store: list[EvidenceBlock],
-    source_table_summaries: list[SourceTableSummary],
+    source_table_summaries: list[SourceTableSummary],  # noqa: ARG001
     settings: Settings,
     repair_errors: list[str] | None = None,
 ) -> DraftDataTable:

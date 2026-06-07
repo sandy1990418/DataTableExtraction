@@ -141,23 +141,16 @@ def _format_summaries(summaries: list[SourceTableSummary]) -> str:
     lines = []
     for s in summaries:
         sample_str = "; ".join(" | ".join(r) for r in s.sample_rows[:3])
+        # include ALL row labels so the planner can enumerate complete candidate_rows
+        labels_str = ", ".join(s.all_row_labels) if s.all_row_labels else "(unknown)"
         lines.append(
             f"[{s.table_id} / {s.evidence_id}] title={s.title or 'untitled'} "
             f"grain={s.guessed_row_grain} headers={s.headers} "
             f"rows={s.row_count} numeric_cols={s.numeric_column_count}\n"
+            f"  all_row_labels: {labels_str}\n"
             f"  sample: {sample_str}"
         )
     return "\n".join(lines)
-
-
-def _format_text_evidence(evidence_store: list[EvidenceBlock], max_items: int = 8) -> str:
-    lines = []
-    for b in evidence_store[:max_items]:
-        if b.table_markdown:
-            continue  # tables already in summaries
-        preview = (b.text or "")[:300].replace("\n", " ")
-        lines.append(f"[{b.evidence_id}] {b.title or ''}: {preview}")
-    return "\n".join(lines) or "(no text evidence)"
 
 
 def _parse_plan(data: dict) -> DataTablePlan:
@@ -201,13 +194,22 @@ def _parse_plan(data: dict) -> DataTablePlan:
     if purpose_type not in ("result_summary", "raw_metric_extraction", "source_table_reconstruction", "system_comparison"):
         purpose_type = "result_summary"
 
+    # For result_summary: enforce standard columns if LLM returned generic/empty columns.
+    _generic_names = {"entity", "description", "column", "attribute"}
+    if purpose_type == "result_summary" and (
+        not columns
+        or all(c.name.lower() in _generic_names for c in columns)
+        or len(columns) < 3
+    ):
+        columns = list(_RESULT_SUMMARY_DEFAULT_COLUMNS)
+
     return DataTablePlan(
         table_title=str(data.get("table_title", "Data Table")).strip() or "Data Table",
         table_purpose=str(data.get("table_purpose", "")).strip(),
         table_purpose_type=purpose_type,  # type: ignore[arg-type]
         row_grain=str(data.get("row_grain", "unknown")).strip() or "unknown",
         table_format=table_format,  # type: ignore[arg-type]
-        columns=columns if len(columns) >= 1 else _FALLBACK_PLAN.columns,
+        columns=columns,
         evidence_decisions=evidence_decisions,
         excluded_source_tables=excluded_source_tables,
         candidate_rows=data.get("candidate_rows", []),
@@ -220,7 +222,7 @@ def _parse_plan(data: dict) -> DataTablePlan:
 
 async def plan_data_table(
     hint: str,
-    evidence_store: list[EvidenceBlock],  # noqa: ARG001 — kept for API consistency
+    evidence_store: list[EvidenceBlock],
     source_table_summaries: list[SourceTableSummary],
     settings: Settings,
     debug_trace: list | None = None,
@@ -251,7 +253,7 @@ async def plan_data_table(
         )
         raw = response.choices[0].message.content or "{}"
         data = _extract_json(raw)
-        return _parse_plan(data)
+        plan = _parse_plan(data)
     except Exception as exc:
         logger.warning("plan_data_table LLM call failed: %s — using fallback plan", exc)
         if debug_trace is not None:
@@ -262,3 +264,21 @@ async def plan_data_table(
                 "raw_output_preview": raw[:300] if raw else "(no output)",
             })
         return _FALLBACK_PLAN
+
+    # Fix 3: normalize evidence_ids — LLM may write "tbl_1" instead of the actual evidence_id.
+    ev_id_set = {b.evidence_id for b in evidence_store}
+    tbl_to_ev = {s.table_id: s.evidence_id for s in source_table_summaries}
+
+    def _resolve(eid: str) -> str:
+        return eid if eid in ev_id_set else tbl_to_ev.get(eid, eid)
+
+    plan.evidence_decisions = [
+        EvidenceDecision(evidence_id=_resolve(d.evidence_id), decision=d.decision, reason=d.reason)
+        for d in plan.evidence_decisions
+    ]
+    plan.excluded_source_tables = [
+        ExcludedSourceTable(table_id=e.table_id, evidence_id=_resolve(e.evidence_id), reason=e.reason)
+        for e in plan.excluded_source_tables
+    ]
+
+    return plan

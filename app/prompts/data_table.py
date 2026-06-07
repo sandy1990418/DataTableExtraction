@@ -125,7 +125,7 @@ Your output is a concise comparison table: ONE ROW PER METHOD / SYSTEM.
 Do NOT produce one row per metric. Summarize multiple metrics in a single cell.
 
 Return a JSON object with:
-- headers: exactly ["Method / System", "Main Benchmark / Task", "Representative Result", "Compared Against", "Key Takeaway", "Limitations / Notes"]
+- headers: exactly ["Method / System", "Main Benchmark / Task", "Representative Result", "Compared Against", "Key Takeaway", "Limitations / Notes", "Sources"]
 - rows: list of row objects, each with:
   - row_label: the method or system name
   - cells: dict mapping each header to a cell object with:

@@ -155,10 +155,51 @@ async def generate_data_table(
         "warnings": errors,
     })
 
-    # Stage 6: repair loop for severe errors
+    # Stage 5b: coverage check — if < 50% of candidate rows produced, trigger coverage repair
+    candidate_count = len(plan.candidate_rows)
+    excluded_labels_lower = {e.row_label.lower() for e in plan.excluded_candidate_rows}
+    produced_labels_lower = {r.entity.name.lower() for r in rows}
+    missing_candidates = [
+        c for c in plan.candidate_rows
+        if c.lower() not in produced_labels_lower and c.lower() not in excluded_labels_lower
+    ]
+    if candidate_count > 0 and len(missing_candidates) > candidate_count * 0.5 and not is_fallback_plan:
+        logger.info(
+            "Coverage gap: %d/%d candidates produced, triggering coverage repair",
+            len(rows), candidate_count,
+        )
+        coverage_errors = [
+            f"Missing rows for: {missing_candidates}. You MUST include a row for each of these methods/systems."
+        ]
+        if plan.table_purpose_type == "result_summary":
+            coverage_draft = await compose_result_summary(
+                hint, plan, evidence_store, source_table_summaries, settings,
+                repair_errors=coverage_errors,
+            )
+        else:
+            coverage_draft = await compose_data_table(
+                hint, plan, evidence_store, source_table_summaries, settings,
+                repair_errors=coverage_errors,
+            )
+        coverage_rows, coverage_schema, coverage_errors_out = verify_draft_table(coverage_draft, plan, evidence_store)
+        debug_trace.append({
+            "stage": "coverage_repair",
+            "before_row_count": len(rows),
+            "after_row_count": len(coverage_rows),
+            "missing_candidates": missing_candidates,
+        })
+        if len(coverage_rows) > len(rows):
+            rows, schema, errors = coverage_rows, coverage_schema, coverage_errors_out
+        else:
+            warnings.append(
+                f"Coverage repair did not improve row count ({len(rows)}/{candidate_count} candidates). "
+                f"Missing: {missing_candidates}"
+            )
+
+    # Stage 6: repair loop for severe citation errors
     severe_errors = [e for e in errors if any(kw in e for kw in _SEVERE_ERROR_KEYWORDS)]
     if severe_errors and _REPAIR_ROUNDS > 0:
-        logger.info("Triggering repair loop: %d severe errors", len(severe_errors))
+        logger.info("Triggering citation repair loop: %d severe errors", len(severe_errors))
         if plan.table_purpose_type == "result_summary" and not is_fallback_plan:
             repaired_draft = await compose_result_summary(
                 hint, plan, evidence_store, source_table_summaries, settings,
@@ -171,7 +212,7 @@ async def generate_data_table(
             )
         repaired_rows, schema, repaired_errors = verify_draft_table(repaired_draft, plan, evidence_store)
         debug_trace.append({
-            "stage": "repair",
+            "stage": "citation_repair",
             "errors_before": len(severe_errors),
             "errors_after": len([e for e in repaired_errors if any(kw in e for kw in _SEVERE_ERROR_KEYWORDS)]),
         })
@@ -179,7 +220,7 @@ async def generate_data_table(
             rows = repaired_rows
             errors = repaired_errors
         else:
-            warnings.append("Repair loop did not improve the table. Using original output with warnings.")
+            warnings.append("Citation repair loop did not improve the table. Using original output.")
 
     # forward non-severe errors as warnings
     for e in errors:
@@ -188,6 +229,20 @@ async def generate_data_table(
 
     if not rows:
         warnings.append("No rows were produced. Evidence may not support the requested table.")
+
+    # Stage 7: final assembly debug trace
+    final_labels_lower = {r.entity.name.lower() for r in rows}
+    debug_trace.append({
+        "stage": "final_assembly",
+        "final_schema_source": "draft_headers",
+        "draft_headers": draft.headers,
+        "exported_headers": [c.name for c in schema.columns],
+        "candidate_row_count": candidate_count,
+        "produced_row_count": len(rows),
+        "dropped_candidate_rows": [
+            c for c in plan.candidate_rows if c.lower() not in final_labels_lower
+        ],
+    })
 
     data_table = GroundedDataTable(
         **{
