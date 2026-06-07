@@ -8,16 +8,17 @@ from app.config import Settings
 from app.models.data_table import (
     DataTableColumn,
     DataTableSchema,
-    GroundedCell,
     GroundedDataTable,
-    GroundedRow,
-    RowEntity,
 )
 from app.services.data_table.evidence_store import build_evidence_store
 from app.services.data_table.exporters import compute_table_metrics
 from app.services.data_table.source_table_summary import summarize_source_tables
-from app.services.data_table.table_composer import compose_data_table
-from app.services.data_table.table_planner import plan_data_table
+from app.services.data_table.table_composer import (
+    build_draft_from_source_table,
+    compose_data_table,
+    compose_long_form_from_source_tables,
+)
+from app.services.data_table.table_planner import _FALLBACK_PLAN, plan_data_table
 from app.services.data_table.table_verifier import verify_draft_table
 from app.services.data_table.text_table_extractor import extract_tables_from_text_blocks, inject_extracted_tables
 
@@ -66,9 +67,22 @@ async def generate_data_table(
     })
 
     # Stage 3: LLM table planner
-    plan = await plan_data_table(hint, evidence_store, source_table_summaries, settings)
+    plan = await plan_data_table(hint, evidence_store, source_table_summaries, settings, debug_trace=debug_trace)
     debug_trace.append({
         "stage": "table_planning",
+        "table_format": plan.table_format,
+        "row_grain": plan.row_grain,
+        "used_source_table_ids": [
+            s.table_id for s in source_table_summaries
+            if s.evidence_id not in {e.evidence_id for e in plan.excluded_source_tables}
+            and any(
+                d.evidence_id == s.evidence_id and d.decision in ("use", "maybe")
+                for d in plan.evidence_decisions
+            )
+        ],
+        "excluded_source_tables": [e.model_dump() for e in plan.excluded_source_tables],
+        "candidate_rows": plan.candidate_rows,
+        "excluded_candidate_rows": [e.model_dump() for e in plan.excluded_candidate_rows],
         "plan": plan.model_dump(),
     })
     if plan.warnings:
@@ -78,13 +92,49 @@ async def generate_data_table(
     if len(plan.columns) > max_columns:
         plan.columns = plan.columns[:max_columns]
 
-    # Stage 4: LLM table composer
-    draft = await compose_data_table(hint, plan, evidence_store, source_table_summaries, settings)
-    debug_trace.append({
-        "stage": "table_composition",
-        "draft_row_count": len(draft.rows),
-        "draft_headers": draft.headers,
-    })
+    # Stage 4: compose
+    # Priority order:
+    #   1. long-form deterministic (plan.table_format == "long" + source tables available)
+    #   2. fallback source-table reconstruction (planner LLM failed)
+    #   3. LLM composer
+    is_fallback_plan = plan.reason == _FALLBACK_PLAN.reason
+    draft = None
+
+    if plan.table_format == "long" and not is_fallback_plan:
+        draft = compose_long_form_from_source_tables(plan, evidence_store, source_table_summaries)
+        if draft:
+            used_ids = [
+                n for n in draft.notes[0].replace(
+                    "Long-form deterministic expansion from source tables: ", ""
+                ).strip("[]'\"").split(",")
+                if n.strip()
+            ] if draft.notes else []
+            debug_trace.append({
+                "stage": "table_composition",
+                "method": "deterministic_long_form_source_table",
+                "source_tables": used_ids,
+                "generated_rows": len(draft.rows),
+                "draft_headers": draft.headers,
+            })
+
+    if draft is None and is_fallback_plan:
+        draft = build_draft_from_source_table(evidence_store, hint)
+        if draft:
+            debug_trace.append({
+                "stage": "table_composition",
+                "method": "source_table_fallback",
+                "draft_row_count": len(draft.rows),
+                "draft_headers": draft.headers,
+            })
+
+    if draft is None:
+        draft = await compose_data_table(hint, plan, evidence_store, source_table_summaries, settings)
+        debug_trace.append({
+            "stage": "table_composition",
+            "method": "llm_composer",
+            "draft_row_count": len(draft.rows),
+            "draft_headers": draft.headers,
+        })
 
     # cap rows to max_rows
     if len(draft.rows) > max_rows:

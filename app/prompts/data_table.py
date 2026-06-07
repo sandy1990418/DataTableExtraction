@@ -74,8 +74,9 @@ Return a JSON object with:
 - table_title: short descriptive title
 - table_purpose: one sentence explaining what this table should show
 - row_grain: what each row represents (be specific: "memory system", "base model + method pair", "dataset", etc.)
+- table_format: one of "wide" or "long" (see rules below)
 - columns: list of column objects, each with:
-  - name: column name (short, clear)
+  - name: column name (short, clear — see naming rules below)
   - description: what this column contains
   - value_type: one of string, number, boolean, date, list, unknown
   - evidence_policy: one of source_table, text, mixed
@@ -83,18 +84,53 @@ Return a JSON object with:
   - evidence_id: the evidence_id from the summaries
   - decision: one of use, maybe, exclude
   - reason: why you made this decision
+- excluded_source_tables: list of objects, each with:
+  - table_id: the table_id from summaries
+  - evidence_id: the evidence_id
+  - reason: why this source table was excluded
+- candidate_rows: list of row label strings you considered including
+- excluded_candidate_rows: list of objects, each with:
+  - row_label: the row you decided NOT to include
+  - reason: why (e.g. "incompatible row grain", "insufficient evidence")
 - generation_policy: one of single_source_table_reconstruction, coherent_synthesis, system_summary_with_metrics
 - warnings: list of any concerns (under-specified hint, insufficient evidence, etc.)
 - reason: brief explanation of your planning decisions
 
-Critical rules:
-- You must decide on ONE consistent row_grain. Do NOT mix rows of different grains.
-- If the hint is ambiguous (e.g. "compare memory experiments"), infer the most useful grain and explain it.
-- Exclude source tables whose row_grain is incompatible with the planned row_grain.
-- Do NOT include rows that mix "base model + method" rows with "memory system" rows.
-- Prefer a smaller coherent table over a large incoherent one.
-- The first column should be the entity/label column (the row identifier).
-- Only include columns answerable from the evidence.
+=== TABLE FORMAT RULES ===
+
+Choose "wide" when ALL rows share the exact same set of metrics/benchmarks.
+Example: all rows have Single-Hop F1, Multi-Hop F1, BLEU-1 → use wide format with those as columns.
+
+Choose "long" when rows come from different benchmarks, or metrics differ across rows.
+Long format uses these columns (adapt names as needed):
+  Method / System | Benchmark / Task | Metric Name | Metric Value | Setting / Model | Notes
+
+If two metrics are always reported together, use paired columns:
+  <Metric A Name> | <Metric A Value> | <Metric B Name> | <Metric B Value>
+NOT: Primary Metric 1 | Primary Metric 2
+
+=== METRIC COLUMN NAMING RULES ===
+
+NEVER use vague placeholder names like:
+  "Primary Metric 1", "Primary Metric 2", "Metric 1", "Metric 2", "Score 1", "Score 2"
+
+Instead:
+- If you know the metric name from the evidence headers/text, use it directly:
+    "Single-Hop F1", "Multi-Hop BLEU-1", "ROUGE-L", "Accuracy"
+- If two metrics appear together consistently, name the pair:
+    "Single-Hop F1" + "Multi-Hop F1"
+- If metrics differ across rows → switch to long format instead.
+
+=== ROW GRAIN RULES ===
+
+You must decide on ONE consistent row_grain. Do NOT mix rows of different grains.
+If the hint is ambiguous, infer the most useful grain and explain it.
+Exclude source tables whose row_grain is incompatible with the planned row_grain.
+Do NOT mix "base model + method" rows with "memory system" rows.
+Prefer a smaller coherent table over a large incoherent one.
+
+The first column should be the entity/label column (the row identifier).
+Only include columns answerable from the evidence.
 """
 
 TABLE_COMPOSER_SYSTEM = """\
@@ -107,8 +143,8 @@ Return a JSON object with:
   - cells: dict mapping column name to cell object, each with:
     - value: the cell value (string, number, boolean, or null)
     - status: one of supported, not_reported, conflicting, inferred
-    - evidence_id: evidence_id of the supporting evidence (required if status=supported)
-    - quote: exact substring from the evidence that supports the value (required if status=supported)
+    - evidence_id: evidence_id of the supporting evidence (required if status=supported or inferred)
+    - quote: exact substring from the evidence that supports the value (required if status=supported or inferred)
 - notes: list of any notes about the table
 
 Critical rules:
@@ -122,6 +158,11 @@ Critical rules:
 - Do NOT copy rows verbatim from source tables if they have a different row_grain than the plan.
 - Do NOT invent values.
 - Prefer a smaller coherent table over including incompatible rows.
+
+Notes column rules:
+- Every Notes cell must have a citation (evidence_id + quote).
+- If you cannot find supporting text, use status=not_reported and null value instead.
+- Do NOT write a Notes value as "inferred" without a quote from the evidence.
 """
 
 CELL_FILL_SYSTEM = """\

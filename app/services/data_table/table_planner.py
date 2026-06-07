@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Literal
 
 from openai import AsyncOpenAI
@@ -30,12 +31,27 @@ class EvidenceDecision(BaseModel):
     reason: str
 
 
+class ExcludedSourceTable(BaseModel):
+    table_id: str
+    evidence_id: str
+    reason: str
+
+
+class ExcludedCandidateRow(BaseModel):
+    row_label: str
+    reason: str
+
+
 class DataTablePlan(BaseModel):
     table_title: str
     table_purpose: str
     row_grain: str
+    table_format: Literal["wide", "long"] = "wide"
     columns: list[PlannedColumn]
     evidence_decisions: list[EvidenceDecision]
+    excluded_source_tables: list[ExcludedSourceTable] = []
+    candidate_rows: list[str] = []
+    excluded_candidate_rows: list[ExcludedCandidateRow] = []
     generation_policy: Literal[
         "single_source_table_reconstruction",
         "coherent_synthesis",
@@ -49,6 +65,7 @@ _FALLBACK_PLAN = DataTablePlan(
     table_title="Data Table",
     table_purpose="Compare entities from provided sources.",
     row_grain="unknown",
+    table_format="wide",
     columns=[
         PlannedColumn(name="Entity", description="The subject being compared.", value_type="string", evidence_policy="mixed"),
         PlannedColumn(name="Description", description="Brief description.", value_type="string", evidence_policy="text"),
@@ -57,6 +74,45 @@ _FALLBACK_PLAN = DataTablePlan(
     generation_policy="coherent_synthesis",
     reason="Fallback plan — LLM planning failed.",
 )
+
+
+def _extract_json(raw: str) -> dict:
+    """Strip markdown fences and extract the first JSON object from raw LLM output."""
+    # strip ```json ... ``` or ``` ... ``` fences
+    raw = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.IGNORECASE)
+    raw = re.sub(r"\s*```$", "", raw.strip())
+
+    # find first '{' and try progressively longer substrings to handle truncation
+    start = raw.find("{")
+    if start == -1:
+        raise ValueError("No JSON object found in output")
+
+    # try full string first (common happy path)
+    candidate = raw[start:]
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        pass
+
+    # try to find balanced braces up to the last complete top-level field
+    depth = 0
+    last_good_pos = start
+    for i, ch in enumerate(candidate):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(candidate[: i + 1])
+                except json.JSONDecodeError:
+                    pass
+        if depth == 1 and ch == ",":
+            last_good_pos = i
+
+    # last resort: truncate at last comma at depth-1 and close the object
+    truncated = candidate[: last_good_pos] + "\n}"
+    return json.loads(truncated)
 
 
 def _format_summaries(summaries: list[SourceTableSummary]) -> str:
@@ -99,16 +155,38 @@ def _parse_plan(data: dict) -> DataTablePlan:
         except Exception:
             pass
 
+    excluded_source_tables = []
+    for exc in data.get("excluded_source_tables", []):
+        try:
+            excluded_source_tables.append(ExcludedSourceTable.model_validate(exc))
+        except Exception:
+            pass
+
+    excluded_candidate_rows = []
+    for exc in data.get("excluded_candidate_rows", []):
+        try:
+            excluded_candidate_rows.append(ExcludedCandidateRow.model_validate(exc))
+        except Exception:
+            pass
+
     policy = data.get("generation_policy", "coherent_synthesis")
     if policy not in ("single_source_table_reconstruction", "coherent_synthesis", "system_summary_with_metrics"):
         policy = "coherent_synthesis"
+
+    table_format = data.get("table_format", "wide")
+    if table_format not in ("wide", "long"):
+        table_format = "wide"
 
     return DataTablePlan(
         table_title=str(data.get("table_title", "Data Table")).strip() or "Data Table",
         table_purpose=str(data.get("table_purpose", "")).strip(),
         row_grain=str(data.get("row_grain", "unknown")).strip() or "unknown",
+        table_format=table_format,  # type: ignore[arg-type]
         columns=columns if len(columns) >= 1 else _FALLBACK_PLAN.columns,
         evidence_decisions=evidence_decisions,
+        excluded_source_tables=excluded_source_tables,
+        candidate_rows=data.get("candidate_rows", []),
+        excluded_candidate_rows=excluded_candidate_rows,
         generation_policy=policy,  # type: ignore[arg-type]
         warnings=data.get("warnings", []),
         reason=str(data.get("reason", "")),
@@ -120,19 +198,21 @@ async def plan_data_table(
     evidence_store: list[EvidenceBlock],
     source_table_summaries: list[SourceTableSummary],
     settings: Settings,
+    debug_trace: list | None = None,
 ) -> DataTablePlan:
     client = AsyncOpenAI(
         api_key=settings.OPENAI_API_KEY,
         base_url=settings.OPENAI_BASE_URL or None,
     )
 
+    # keep the user message short: summaries only, no long evidence text
     user_msg = (
         f"User hint: {hint}\n\n"
         f"Source table summaries:\n{_format_summaries(source_table_summaries)}\n\n"
-        f"Text evidence snippets:\n{_format_text_evidence(evidence_store)}\n\n"
-        "Return JSON only."
+        "Return compact JSON only. No markdown fences."
     )
 
+    raw = ""
     try:
         response = await client.chat.completions.create(
             model=settings.OPENAI_MODEL,
@@ -140,13 +220,20 @@ async def plan_data_table(
                 {"role": "system", "content": TABLE_PLANNER_SYSTEM},
                 {"role": "user", "content": user_msg},
             ],
-            max_completion_tokens=1024,
+            max_completion_tokens=2048,
             temperature=0.0,
             response_format={"type": "json_object"},
         )
         raw = response.choices[0].message.content or "{}"
-        data = json.loads(raw)
+        data = _extract_json(raw)
         return _parse_plan(data)
     except Exception as exc:
         logger.warning("plan_data_table LLM call failed: %s — using fallback plan", exc)
+        if debug_trace is not None:
+            debug_trace.append({
+                "stage": "table_planning_error",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "raw_output_preview": raw[:300] if raw else "(no output)",
+            })
         return _FALLBACK_PLAN

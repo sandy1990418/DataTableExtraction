@@ -19,6 +19,11 @@ from app.services.data_table.table_planner import DataTablePlan
 
 _NUMERIC_RE = re.compile(r"-?\d+\.?\d*")
 
+_VAGUE_HEADER_PATTERNS = re.compile(
+    r"^(primary\s+)?metric\s*[12345]$|^score\s*[12345]$|^value\s*[12345]$|^column\s*[12345]$",
+    re.IGNORECASE,
+)
+
 
 def _ev_text(block: EvidenceBlock) -> str:
     parts = [block.text or ""]
@@ -194,13 +199,29 @@ def verify_draft_table(
             if name != col_names[0]
         ]
         if all_data_cells:
-            unsupported_ratio = sum(
+            empty_ratio = sum(
                 1 for c in all_data_cells if c.status in ("not_reported", "unsupported")
             ) / len(all_data_cells)
-            if unsupported_ratio > 0.4:
+            if empty_ratio > 0.3:
                 warnings.append(
-                    f"{unsupported_ratio:.0%} of cells are not reported or unsupported. "
+                    f"{empty_ratio:.0%} of cells are empty or unsupported. "
                     "Evidence may not cover the requested table."
                 )
+
+    # vague header names
+    vague_headers = [h for h in col_names if _VAGUE_HEADER_PATTERNS.match(h.strip())]
+    if vague_headers:
+        warnings.append(
+            f"Vague column names detected: {vague_headers}. "
+            "Use specific metric names (e.g. 'Single-Hop F1') or switch to long format."
+        )
+
+    # row count much smaller than candidate count
+    candidate_count = len(plan.candidate_rows)
+    if candidate_count > 0 and len(rows) < candidate_count * 0.5:
+        warnings.append(
+            f"Only {len(rows)} rows produced from {candidate_count} candidates. "
+            "Some candidate rows may have been silently dropped."
+        )
 
     return rows, schema, errors + warnings

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Literal
 
 from openai import AsyncOpenAI
@@ -12,6 +13,10 @@ from pydantic import BaseModel
 from app.config import Settings
 from app.models.data_table import EvidenceBlock
 from app.prompts.data_table import TABLE_COMPOSER_SYSTEM
+from app.services.data_table.source_table_rows import (
+    extract_source_table_candidates,
+    parse_markdown_table,
+)
 from app.services.data_table.source_table_summary import SourceTableSummary
 from app.services.data_table.table_planner import DataTablePlan
 
@@ -81,6 +86,26 @@ def _format_summaries(summaries: list[SourceTableSummary], allowed_ids: set[str]
     return "\n".join(lines) or "(none)"
 
 
+def _normalize_notes(raw_notes) -> list[str]:
+    """Normalize notes to list[str], handling str, list[str], and list[dict]."""
+    if raw_notes is None:
+        return []
+    if isinstance(raw_notes, str):
+        return [raw_notes] if raw_notes else []
+    if not isinstance(raw_notes, list):
+        return [str(raw_notes)]
+    result = []
+    for item in raw_notes:
+        if isinstance(item, str):
+            result.append(item)
+        elif isinstance(item, dict):
+            text = item.get("value") or item.get("text") or item.get("note") or ""
+            result.append(str(text) if text else json.dumps(item))
+        else:
+            result.append(str(item))
+    return result
+
+
 def _parse_draft(data: dict, plan: DataTablePlan) -> DraftDataTable:
     headers = data.get("headers", [c.name for c in plan.columns])
     raw_rows = data.get("rows", [])
@@ -111,8 +136,265 @@ def _parse_draft(data: dict, plan: DataTablePlan) -> DraftDataTable:
     return DraftDataTable(
         headers=headers,
         rows=rows,
-        notes=data.get("notes", []),
+        notes=_normalize_notes(data.get("notes")),
     )
+
+
+def build_draft_from_source_table(
+    evidence_store: list[EvidenceBlock],
+    hint: str,
+) -> DraftDataTable | None:
+    """Fallback: build a DraftDataTable directly from the best matching source table.
+
+    Used when the planner fails (returns the generic fallback plan) so we still
+    produce useful output without an LLM composer call.
+    """
+    candidates = extract_source_table_candidates(evidence_store, hint)
+    if not candidates:
+        return None
+    best = candidates[0]
+    if best.score < 5.0 or not best.headers or not best.rows:
+        return None
+
+    headers = best.headers
+    rows: list[DraftRow] = []
+    for src_row in best.rows:
+        label = src_row[0].strip() if src_row else ""
+        if not label:
+            continue
+        cells: dict[str, DraftCell] = {}
+        for i, header in enumerate(headers):
+            if i == 0:
+                cells[header] = DraftCell(value=label, status="supported",
+                                          evidence_id=best.evidence_id,
+                                          quote=label)
+                continue
+            value_str = src_row[i].strip() if i < len(src_row) else ""
+            if not value_str:
+                cells[header] = DraftCell(value=None, status="not_reported")
+                continue
+            value: str | float = value_str
+            try:
+                value = float(value_str.replace(",", ""))
+            except ValueError:
+                pass
+            row_quote = " | ".join(f"{h}={v}" for h, v in zip(headers, src_row) if v.strip())
+            cells[header] = DraftCell(
+                value=value,
+                status="supported",
+                evidence_id=best.evidence_id,
+                quote=row_quote,
+            )
+        rows.append(DraftRow(row_label=label, cells=cells))
+
+    return DraftDataTable(
+        headers=headers,
+        rows=rows,
+        notes=["Fallback source table reconstruction because planner failed."],
+    )
+
+
+_ENTITY_HEADERS = re.compile(
+    r"^(method|model|model[\s_/]?method|system|approach|algorithm|baseline|name)$",
+    re.IGNORECASE,
+)
+_METRIC_HEADERS = re.compile(
+    r"f1|bleu|accuracy|recall|precision|score|em|overall|average|ranking|rouge|meteor|sbert",
+    re.IGNORECASE,
+)
+_SETTING_HEADERS = re.compile(
+    r"^(setting|model|config|configuration|backbone|base[\s_]?model|llm)$",
+    re.IGNORECASE,
+)
+_CATEGORY_HEADERS = re.compile(
+    r"^(category|type|group|domain|task|subtask|benchmark|dataset)$",
+    re.IGNORECASE,
+)
+_NUMERIC_CELL_RE = re.compile(r"^\s*-?\d")
+
+
+def _row_quote(headers: list[str], row: list[str]) -> str:
+    return " | ".join(f"{h}={v}" for h, v in zip(headers, row) if v.strip())
+
+
+def _find_col_idx(headers: list[str], pattern: re.Pattern) -> int | None:
+    for i, h in enumerate(headers):
+        if pattern.match(h.strip()):
+            return i
+    return None
+
+
+def _find_metric_col_indices(headers: list[str], rows: list[list[str]]) -> list[int]:
+    """Return indices of columns that are metric/numeric columns (not entity/setting/category)."""
+    indices = []
+    for i, h in enumerate(headers):
+        h_stripped = h.strip()
+        if _ENTITY_HEADERS.match(h_stripped):
+            continue
+        if _SETTING_HEADERS.match(h_stripped):
+            continue
+        # include if header looks like a metric OR if sample values are numeric
+        if _METRIC_HEADERS.search(h_stripped):
+            indices.append(i)
+            continue
+        sample = [row[i] for row in rows[:5] if i < len(row) and row[i].strip()]
+        if sample and sum(1 for v in sample if _NUMERIC_CELL_RE.match(v)) >= len(sample) * 0.5:
+            indices.append(i)
+    return indices
+
+
+def _long_form_headers(plan: DataTablePlan) -> list[str]:
+    """Return the long-form column headers, using plan columns when they match, else defaults."""
+    plan_names = {c.name.lower() for c in plan.columns}
+    defaults = ["Method / System", "Benchmark / Task", "Metric Name", "Metric Value",
+                 "Setting / Model", "Notes"]
+    # if plan has named these columns, use plan names in order
+    if len(plan.columns) >= 4:
+        return [c.name for c in plan.columns]
+    return defaults
+
+
+def compose_long_form_from_source_tables(
+    plan: DataTablePlan,
+    evidence_store: list[EvidenceBlock],
+    source_table_summaries: list[SourceTableSummary],
+) -> DraftDataTable | None:
+    """Deterministic long-form composer: one output row per (source-row × metric-column).
+
+    Used when plan.table_format == "long" and source tables are available.
+    Never calls LLM — no JSON truncation possible.
+    """
+    # collect allowed evidence ids from plan
+    excluded_ids = {d.evidence_id for d in plan.evidence_decisions if d.decision == "exclude"}
+    # prefer explicitly used tables; fall back to any non-excluded table with markdown
+    used_ev_ids = {d.evidence_id for d in plan.evidence_decisions if d.decision in ("use", "maybe")}
+    if not used_ev_ids:
+        used_ev_ids = {b.evidence_id for b in evidence_store if b.table_markdown and b.evidence_id not in excluded_ids}
+
+    out_headers = _long_form_headers(plan)
+    # resolve output column positions by name (case-insensitive)
+    col_map: dict[str, int] = {h.lower(): i for i, h in enumerate(out_headers)}
+
+    def _col_pos(candidates: list[str]) -> int | None:
+        for c in candidates:
+            pos = col_map.get(c.lower())
+            if pos is not None:
+                return pos
+        return None
+
+    pos_method = _col_pos(["method / system", "method", "system", "approach", out_headers[0]])
+    pos_bench = _col_pos(["benchmark / task", "benchmark", "task", "dataset"])
+    pos_metric_name = _col_pos(["metric name", "metric"])
+    pos_metric_value = _col_pos(["metric value", "value", "score"])
+    pos_setting = _col_pos(["setting / model", "setting", "model", "backbone"])
+    pos_notes = _col_pos(["notes", "note"])
+
+    # mandatory columns — if the plan has no matching slots we cannot proceed
+    if pos_method is None or pos_metric_name is None or pos_metric_value is None:
+        return None
+
+    output_rows: list[DraftRow] = []
+    used_table_ids: list[str] = []
+
+    for block in evidence_store:
+        if block.evidence_id not in used_ev_ids:
+            continue
+        if not block.table_markdown:
+            continue
+
+        headers, rows = parse_markdown_table(block.table_markdown)
+        if not headers or not rows:
+            continue
+
+        entity_col = _find_col_idx(headers, _ENTITY_HEADERS)
+        if entity_col is None:
+            entity_col = 0
+
+        setting_col = _find_col_idx(headers, _SETTING_HEADERS)
+        # avoid using the entity column as the setting column
+        if setting_col == entity_col:
+            setting_col = None
+
+        category_col = _find_col_idx(headers, _CATEGORY_HEADERS)
+
+        metric_cols = _find_metric_col_indices(headers, rows)
+        if not metric_cols:
+            continue
+
+        bench_name = block.title or block.document_name or ""
+        used_table_ids.append(block.evidence_id)
+
+        for src_row in rows:
+            entity_val = src_row[entity_col].strip() if entity_col < len(src_row) else ""
+            if not entity_val:
+                continue
+
+            setting_val = ""
+            if setting_col is not None and setting_col < len(src_row):
+                setting_val = src_row[setting_col].strip()
+
+            category_val = ""
+            if category_col is not None and category_col < len(src_row):
+                category_val = src_row[category_col].strip()
+
+            quote = _row_quote(headers, src_row)
+
+            for m_idx in metric_cols:
+                if m_idx >= len(src_row):
+                    continue
+                metric_val_str = src_row[m_idx].strip()
+                if not metric_val_str:
+                    continue
+                metric_name = headers[m_idx].strip()
+
+                # parse numeric value
+                metric_val: str | float = metric_val_str
+                try:
+                    metric_val = float(metric_val_str.replace(",", ""))
+                except ValueError:
+                    pass
+
+                # build the output cell dict aligned to out_headers
+                cell_values: list[str | float | None] = [None] * len(out_headers)
+                cell_values[pos_method] = entity_val
+                if pos_bench is not None:
+                    cell_values[pos_bench] = bench_name
+                cell_values[pos_metric_name] = metric_name
+                cell_values[pos_metric_value] = metric_val
+                if pos_setting is not None:
+                    cell_values[pos_setting] = setting_val or None
+                if pos_notes is not None:
+                    cell_values[pos_notes] = category_val or None
+
+                cells: dict[str, DraftCell] = {}
+                for i, h in enumerate(out_headers):
+                    v = cell_values[i]
+                    if v is None or v == "":
+                        cells[h] = DraftCell(value=None, status="not_reported")
+                    else:
+                        cells[h] = DraftCell(
+                            value=v,
+                            status="supported",
+                            evidence_id=block.evidence_id,
+                            quote=quote,
+                        )
+
+                row_label = f"{entity_val} — {metric_name}"
+                output_rows.append(DraftRow(row_label=row_label, cells=cells))
+
+    if not output_rows:
+        return None
+
+    return DraftDataTable(
+        headers=out_headers,
+        rows=output_rows,
+        notes=[f"Long-form deterministic expansion from source tables: {used_table_ids}"],
+    )
+
+
+# LLM composer hard limits
+_LLM_MAX_ROWS = 12
+_LLM_MAX_CELLS = 60
 
 
 async def compose_data_table(
@@ -130,6 +412,10 @@ async def compose_data_table(
 
     allowed_ids = _allowed_evidence_ids(plan, evidence_store)
 
+    # apply hard limits to keep LLM output small
+    max_rows = _LLM_MAX_ROWS
+    max_cells = _LLM_MAX_CELLS
+
     repair_section = ""
     if repair_errors:
         repair_section = (
@@ -144,7 +430,8 @@ async def compose_data_table(
         f"Source table summaries (allowed):\n{_format_summaries(source_table_summaries, allowed_ids)}\n\n"
         f"Evidence:\n{_format_evidence(evidence_store, allowed_ids)}"
         f"{repair_section}\n\n"
-        "Return JSON only."
+        f"HARD LIMITS: max {max_rows} rows, max {max_cells} total cells.\n"
+        "For each cell use short quote (≤60 chars). Return compact JSON only. No markdown fences."
     )
 
     try:
@@ -160,7 +447,11 @@ async def compose_data_table(
         )
         raw = response.choices[0].message.content or "{}"
         data = json.loads(raw)
-        return _parse_draft(data, plan)
+        draft = _parse_draft(data, plan)
+        # enforce hard row cap
+        if len(draft.rows) > max_rows:
+            draft.rows = draft.rows[:max_rows]
+        return draft
     except Exception as exc:
         logger.warning("compose_data_table LLM call failed: %s", exc)
         return DraftDataTable(headers=[c.name for c in plan.columns], rows=[], notes=[str(exc)])
