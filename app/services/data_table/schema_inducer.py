@@ -4,14 +4,19 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 
 from openai import AsyncOpenAI
 
 from app.config import Settings
 from app.models.data_table import DataTableColumn, DataTableSchema, EvidenceBlock
 from app.prompts.data_table import SCHEMA_INDUCTION_SYSTEM
+from app.services.data_table.source_table_rows import extract_source_table_candidates
 
 logger = logging.getLogger(__name__)
+
+_RESULT_TABLE_KINDS = {"benchmark_results", "experiment_results"}
+_NUMERIC_RE = re.compile(r"^\d")
 
 _DEFAULT_COLUMNS = [
     DataTableColumn(name="Entity", role="entity", description="The subject being compared.", required=True),
@@ -43,6 +48,66 @@ def _parse_columns(raw_columns: list[dict]) -> list[DataTableColumn]:
     return columns
 
 
+def _infer_value_type(header: str, sample_values: list[str]) -> str:
+    """Guess value_type from header name and sample cell values."""
+    h = header.lower().replace("-", "_").replace(" ", "_")
+    if any(num in h for num in ["score", "rouge", "bleu", "f1", "accuracy", "meteor", "sbert", "rate", "ratio"]):
+        return "number"
+    if sample_values and all(_NUMERIC_RE.match(v.strip()) for v in sample_values if v.strip()):
+        return "number"
+    return "string"
+
+
+def induce_schema_from_source_tables(
+    hint: str,
+    intent: dict,
+    evidence_store: list[EvidenceBlock],
+    max_columns: int,
+) -> DataTableSchema | None:
+    """Build schema directly from best matching source table headers.
+
+    Used for benchmark/result mode to avoid LLM hallucinating column names.
+    """
+    candidates = extract_source_table_candidates(evidence_store, hint)
+    if not candidates:
+        return None
+
+    best = candidates[0]
+    if best.score < 5.0 or not best.headers:
+        return None
+
+    columns: list[DataTableColumn] = []
+    for i, header in enumerate(best.headers[:max_columns]):
+        name = header.strip() or f"col_{i}"
+        if not name:
+            continue
+        # sample values for type inference
+        sample = [row[i] for row in best.rows[:3] if i < len(row)]
+        role = "entity" if i == 0 else "metric"
+        # check if it looks like a category/label column
+        if i > 0 and not any(_NUMERIC_RE.match(v.strip()) for v in sample if v.strip()):
+            role = "attribute"
+        vtype = _infer_value_type(name, sample) if i > 0 else "string"
+        columns.append(
+            DataTableColumn(
+                name=name,
+                role=role,
+                description=f"{name} from benchmark results.",
+                value_type=vtype,
+                required=(i == 0),
+            )
+        )
+
+    if len(columns) < 2:
+        return None
+
+    return DataTableSchema(
+        title=best.title or "Benchmark Results",
+        intent=intent.get("intent", hint),
+        columns=columns,
+    )
+
+
 async def induce_schema(
     hint: str,
     table_intent: dict,
@@ -51,6 +116,17 @@ async def induce_schema(
     max_columns: int = 6,
 ) -> DataTableSchema:
     """Call LLM to design table columns, return validated DataTableSchema."""
+    # for benchmark/result mode, use source table headers directly
+    _use_source_table = (
+        table_intent.get("strategy") in ("source_table_reconstruction", "hybrid_table_synthesis")
+        or table_intent.get("table_kind") in _RESULT_TABLE_KINDS
+        or table_intent.get("row_discovery_mode") == "source_table_rows"
+    )
+    if _use_source_table:
+        table_schema = induce_schema_from_source_tables(hint, table_intent, evidence_store, max_columns)
+        if table_schema:
+            return table_schema
+
     client = AsyncOpenAI(
         api_key=settings.OPENAI_API_KEY,
         base_url=settings.OPENAI_BASE_URL or None,

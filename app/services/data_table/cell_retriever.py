@@ -27,6 +27,7 @@ def _score_block(
     query: Counter,
     entity: RowEntity,
     column: DataTableColumn,
+    entity_source_ev_ids: set[str],
 ) -> float:
     target = extract_keywords(f"{block.title or ''} {block.text} {block.table_markdown or ''}")
     score = float(overlap_score(query, target))
@@ -49,6 +50,12 @@ def _score_block(
     if column.value_type == "number" and _NUMBER_RE.search(block.text or ""):
         score += 2.0
 
+    # strong boost: this is the source table that created the entity row
+    if block.evidence_id in entity_source_ev_ids:
+        score += 10.0
+        if column.role == "metric" and block.table_markdown:
+            score += 20.0
+
     return score
 
 
@@ -63,9 +70,11 @@ def retrieve_cell_evidence(
     """Score all evidence blocks for a specific entity × column pair, return top-k."""
     query = _query_keywords(entity, column, hint)
 
+    entity_source_ev_ids = {ref.evidence_id for ref in entity.source_refs}
+
     scored = []
     for block in evidence_store:
-        score = _score_block(block, query, entity, column)
+        score = _score_block(block, query, entity, column, entity_source_ev_ids)
         if score > 0:
             scored.append((block, score))
 

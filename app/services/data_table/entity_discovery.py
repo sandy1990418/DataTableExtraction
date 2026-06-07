@@ -10,6 +10,11 @@ from openai import AsyncOpenAI
 from app.config import Settings
 from app.models.data_table import DataTableSchema, EvidenceBlock, RowEntity, SourceRef
 from app.prompts.data_table import ENTITY_DISCOVERY_SYSTEM
+from app.services.data_table.source_table_rows import (
+    _normalize,
+    extract_source_table_candidates,
+    find_entity_column_index,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -75,17 +80,113 @@ def _dedup_entities(entities: list[RowEntity]) -> list[RowEntity]:
     return list(seen.values())
 
 
+def _discover_entities_from_source_tables(
+    evidence_store: list[EvidenceBlock],
+    hint: str,
+    max_rows: int,
+    debug_trace: list | None = None,
+) -> list[RowEntity]:
+    """Extract row entities from top-scoring source table rows."""
+    candidates = extract_source_table_candidates(evidence_store, hint)
+    evidence_index = {b.evidence_id: b for b in evidence_store}
+
+    if not candidates:
+        return []
+
+    if debug_trace is not None:
+        debug_trace.append({
+            "stage": "source_table_candidates",
+            "candidates": [
+                {"evidence_id": c.evidence_id, "headers": c.headers, "score": round(c.score, 2)}
+                for c in candidates[:5]
+            ],
+        })
+
+    # use top candidate as schema reference; merge compatible tables for rows
+    best = candidates[0]
+    best_headers_norm = [_normalize(h) for h in best.headers]
+    entity_col = find_entity_column_index(best.headers)
+
+    # collect compatible tables: same entity col position, overlapping headers
+    compatible = [best]
+    for cand in candidates[1:]:
+        if cand.score < 3.0:
+            break
+        if find_entity_column_index(cand.headers) != entity_col:
+            continue
+        cand_norm = [_normalize(h) for h in cand.headers]
+        overlap = len(set(best_headers_norm) & set(cand_norm))
+        if overlap >= max(2, len(best_headers_norm) // 2):
+            compatible.append(cand)
+
+    entities: list[RowEntity] = []
+    seen: set[str] = set()
+    ent_idx = 0
+
+    for cand in compatible:
+        block = evidence_index.get(cand.evidence_id)
+        for row in cand.rows:
+            if entity_col >= len(row):
+                continue
+            name = row[entity_col].strip()
+            if not name or name.lower() in seen:
+                continue
+            seen.add(name.lower())
+            ent_idx += 1
+            if ent_idx > max_rows:
+                break
+
+            source_refs = [block.source_ref] if block else []
+            entities.append(
+                RowEntity(
+                    entity_id=f"ent_{ent_idx}",
+                    name=name,
+                    aliases=[],
+                    description=None,
+                    source_refs=source_refs,
+                    confidence=0.9 if block else 0.5,
+                )
+            )
+
+    if debug_trace is not None:
+        debug_trace.append({
+            "stage": "entity_discovery",
+            "mode": "source_table_rows",
+            "entities": [e.name for e in entities],
+            "tables_used": [c.evidence_id for c in compatible],
+        })
+
+    return entities
+
+
 async def discover_entities(
     hint: str,
     schema: DataTableSchema,
     evidence_store: list[EvidenceBlock],
     settings: Settings,
     max_rows: int = 20,
+    row_discovery_mode: str = "primary_subjects",
+    table_intent: dict | None = None,
+    debug_trace: list | None = None,
 ) -> list[RowEntity]:
     """Extract candidate row entities from evidence."""
     if not evidence_store:
         logger.warning("discover_entities: empty evidence store")
         return []
+
+    strategy = (table_intent or {}).get("strategy", row_discovery_mode)
+
+    # source_table_reconstruction: rows exclusively from table rows
+    if strategy == "source_table_reconstruction" or row_discovery_mode == "source_table_rows":
+        entities = _discover_entities_from_source_tables(evidence_store, hint, max_rows, debug_trace)
+        if entities:
+            return entities
+        logger.warning("source_table_rows mode: no table candidates — falling back to LLM discovery")
+
+    # hybrid: merge source-table rows with LLM-discovered primary subjects
+    elif strategy == "hybrid_table_synthesis":
+        table_entities = _discover_entities_from_source_tables(evidence_store, hint, max_rows, debug_trace)
+        # LLM discovery continues below; will be merged after
 
     client = AsyncOpenAI(
         api_key=settings.OPENAI_API_KEY,
@@ -133,13 +234,19 @@ async def discover_entities(
         return []
 
     raw_entities = data.get("entities", [])
-    entities: list[RowEntity] = []
+    llm_entities: list[RowEntity] = []
     for raw in raw_entities[:max_rows]:
         ent = _build_row_entity(raw, evidence_index)
         if ent:
-            entities.append(ent)
+            llm_entities.append(ent)
 
-    entities = _dedup_entities(entities)
+    # hybrid: merge table-derived rows with LLM primary subjects
+    if strategy == "hybrid_table_synthesis":
+        pre_table = locals().get("table_entities", [])
+        combined = [*pre_table, *llm_entities]
+        entities = _dedup_entities(combined)
+    else:
+        entities = _dedup_entities(llm_entities)
 
     if not entities:
         logger.warning("discover_entities: no entities found")

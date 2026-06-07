@@ -1,19 +1,20 @@
 """System prompts for NotebookLM-style grounded data table generation."""
 
 TABLE_INTENT_SYSTEM = """\
-You are a data table analyst. Given a user hint and a list of evidence summaries, detect what kind of data table the user wants.
+You are a data table analyst. Given a user hint and a list of evidence summaries, describe what the user wants.
 
 Return a JSON object with:
 - intent: one sentence describing what comparison or analysis the table should perform
-- table_kind: one of comparison, timeline, action_items, entity_attribute, experiment_results, literature_review, generic
-- row_grain: what each row represents (e.g. "models", "papers", "companies")
-- expected_columns: list of 3-6 useful column names
+- table_kind: one of comparison, timeline, action_items, entity_attribute, experiment_results, benchmark_results, literature_review, generic
+- row_grain: what each row represents (e.g. "models", "methods", "papers", "companies")
+- expected_columns: list of 3-6 useful column names (description only — do not generate data)
 - notes: brief note about the user's intent
 
 Rules:
 - Do not generate table rows or data.
-- Focus only on understanding what the user wants to compare or analyze.
+- Focus only on describing what the user wants to compare or analyze.
 - Be specific about row_grain.
+- Pipeline routing is handled separately; you only provide human-readable description.
 """
 
 SCHEMA_INDUCTION_SYSTEM = """\
@@ -62,6 +63,65 @@ Rules:
 - If no entity is found, return empty list with a warning.
 - Entities with weak evidence get lower confidence (below 0.5).
 - Maximum entities: as specified by max_rows.
+"""
+
+TABLE_PLANNER_SYSTEM = """\
+You are a data table planner. Given a user hint, source table summaries, and text evidence, produce a coherent plan for a data table.
+
+You are NOT generating the table yet. You are deciding what the table should look like.
+
+Return a JSON object with:
+- table_title: short descriptive title
+- table_purpose: one sentence explaining what this table should show
+- row_grain: what each row represents (be specific: "memory system", "base model + method pair", "dataset", etc.)
+- columns: list of column objects, each with:
+  - name: column name (short, clear)
+  - description: what this column contains
+  - value_type: one of string, number, boolean, date, list, unknown
+  - evidence_policy: one of source_table, text, mixed
+- evidence_decisions: list of objects, each with:
+  - evidence_id: the evidence_id from the summaries
+  - decision: one of use, maybe, exclude
+  - reason: why you made this decision
+- generation_policy: one of single_source_table_reconstruction, coherent_synthesis, system_summary_with_metrics
+- warnings: list of any concerns (under-specified hint, insufficient evidence, etc.)
+- reason: brief explanation of your planning decisions
+
+Critical rules:
+- You must decide on ONE consistent row_grain. Do NOT mix rows of different grains.
+- If the hint is ambiguous (e.g. "compare memory experiments"), infer the most useful grain and explain it.
+- Exclude source tables whose row_grain is incompatible with the planned row_grain.
+- Do NOT include rows that mix "base model + method" rows with "memory system" rows.
+- Prefer a smaller coherent table over a large incoherent one.
+- The first column should be the entity/label column (the row identifier).
+- Only include columns answerable from the evidence.
+"""
+
+TABLE_COMPOSER_SYSTEM = """\
+You are a data table composer. Given a table plan and evidence, produce the actual table content.
+
+Return a JSON object with:
+- headers: list of column names (must match the plan's column names exactly)
+- rows: list of row objects, each with:
+  - row_label: the entity/subject name for this row
+  - cells: dict mapping column name to cell object, each with:
+    - value: the cell value (string, number, boolean, or null)
+    - status: one of supported, not_reported, conflicting, inferred
+    - evidence_id: evidence_id of the supporting evidence (required if status=supported)
+    - quote: exact substring from the evidence that supports the value (required if status=supported)
+- notes: list of any notes about the table
+
+Critical rules:
+- Follow the table plan exactly. Use only the planned columns.
+- Only produce rows with the planned row_grain. Do NOT mix row grains.
+- Only use evidence marked as use or maybe in the plan.
+- For every supported cell, you MUST provide evidence_id and quote.
+- The quote MUST be a substring or close paraphrase from the evidence text.
+- For numeric values, the quote MUST contain the number.
+- If a value is not found in evidence, use not_reported with null value.
+- Do NOT copy rows verbatim from source tables if they have a different row_grain than the plan.
+- Do NOT invent values.
+- Prefer a smaller coherent table over including incompatible rows.
 """
 
 CELL_FILL_SYSTEM = """\

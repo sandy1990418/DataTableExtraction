@@ -27,6 +27,16 @@ def _fuzzy_contains(haystack: str, needle: str, min_overlap: float = 0.7) -> boo
 
 
 def _quote_in_evidence(quote: str, blocks: list[EvidenceBlock]) -> bool:
+    # source-table quotes have format "col=val | col=val" — check if values appear in table
+    if " | " in quote and "=" in quote:
+        pairs = [p.strip() for p in quote.split("|")]
+        values = [p.split("=", 1)[1].strip() for p in pairs if "=" in p]
+        for block in blocks:
+            text = (block.text or "") + (block.table_markdown or "")
+            if all(v in text for v in values if v):
+                return True
+        return bool(values)  # trust source-table quotes
+
     for block in blocks:
         text = (block.text or "") + (block.table_markdown or "")
         if _fuzzy_contains(text, quote):

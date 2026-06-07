@@ -76,6 +76,24 @@ class GroundedRow(BaseModel):
     cells: dict[str, GroundedCell]
 
 
+class DataTableIntent(BaseModel):
+    intent: str
+    table_kind: Literal[
+        "comparison",
+        "timeline",
+        "action_items",
+        "entity_attribute",
+        "experiment_results",
+        "benchmark_results",
+        "literature_review",
+        "generic",
+    ] = "generic"
+    row_grain: str = "unknown"
+    expected_columns: list[str] = Field(default_factory=list)
+    row_discovery_mode: Literal["primary_subjects", "source_table_rows", "hybrid"] = "primary_subjects"
+    notes: str = ""
+
+
 class GroundedDataTable(BaseModel):
     schema_: DataTableSchema = Field(alias="schema")
     rows: list[GroundedRow] = Field(default_factory=list)
