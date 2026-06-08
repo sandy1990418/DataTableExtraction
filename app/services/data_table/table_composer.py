@@ -497,15 +497,16 @@ def _build_entity_evidence(
     section_lines = [f"--- {entity} (document: {matched_doc}) ---"]
 
     table_added = False
+    text_header_added = False
     for b in ordered:
         if b.table_markdown and not table_added:
             section_lines.append("Source table (from this system's own paper):")
             section_lines.append(f"  [{b.evidence_id}] {b.title or 'Table'}\n{b.table_markdown}")
             table_added = True
         elif b.text:
-            if not table_added and not any("Paper text" in l for l in section_lines):
-                # haven't seen a table yet, start text section
-                pass
+            if not text_header_added:
+                section_lines.append("Paper text (abstract / method / results):")
+                text_header_added = True
             text = (b.text or "").strip()
             section_lines.append(f"  [{b.evidence_id}] {b.title or ''}: {text}")
 
@@ -515,14 +516,14 @@ def _build_entity_evidence(
 async def _compose_single_entity_row(
     entity: str,
     hint: str,
-    plan_columns: list[str],
     entity_evidence: str,
     rsp_guidance: str,
     repair_errors: list[str] | None,
     client: AsyncOpenAI,
     model: str,
-) -> DraftRow | None:
-    """Call the LLM once for a single entity row. Returns None on failure."""
+    fixed_columns: list[str] | None = None,
+) -> dict | None:
+    """Call the LLM once for a single entity. Returns raw dict with discovered_columns + cells."""
     repair_section = ""
     if repair_errors:
         repair_section = (
@@ -531,18 +532,27 @@ async def _compose_single_entity_row(
             + "\n"
         )
 
+    if fixed_columns:
+        # Architecture mode: columns are pre-specified, no discovery needed
+        col_instruction = (
+            f"Use exactly these columns (pre-specified): {fixed_columns}\n"
+            "Return discovered_columns = the same list.\n"
+        )
+    else:
+        col_instruction = (
+            "Discover columns from this paper's own tables and text.\n"
+            "Always start with 'Method / System'.\n"
+        )
+
     user_msg = (
         f"User hint: {hint}\n\n"
-        f"Columns to fill: {plan_columns}\n"
-        f"Row to produce: {entity}\n\n"
+        f"System to extract: {entity}\n"
+        f"{col_instruction}\n"
         f"=== Evidence from {entity}'s own paper ===\n"
-        f"Use this as the PRIMARY source. Do NOT rely on another paper's comparison table.\n\n"
         f"{entity_evidence}"
         f"{rsp_guidance}"
         f"{repair_section}\n\n"
-        "Return a JSON object with a single 'row' key:\n"
-        '{"row": {"row_label": "<entity>", "cells": {<col>: {"value": ..., "status": ..., "evidence_id": ..., "quote": ...}, ...}}}\n'
-        "No markdown fences."
+        "Return compact JSON only. No markdown fences."
     )
 
     try:
@@ -558,13 +568,48 @@ async def _compose_single_entity_row(
         )
         raw = response.choices[0].message.content or "{}"
         data = json.loads(raw)
+        # Normalise: accept {"row": {...}} or flat format
+        if "row" in data and isinstance(data["row"], dict):
+            data = data["row"]
+        data.setdefault("row_label", entity)
+        return data
+    except Exception as exc:
+        logger.warning("compose single entity row failed for %s: %s", entity, exc)
+        return None
 
-        # Accept both {"row": {...}} and direct row object formats
-        raw_row = data.get("row") or data
-        label = str(raw_row.get("row_label", entity)).strip() or entity
-        raw_cells = raw_row.get("cells", {})
+
+def _align_rows(
+    raw_results: list[dict],
+    fallback_columns: list[str],
+) -> tuple[list[str], list[DraftRow]]:
+    """Merge per-entity discovered columns into a unified column list, then build DraftRows."""
+    from collections import Counter
+
+    col_counter: Counter = Counter()
+    for r in raw_results:
+        for col in r.get("discovered_columns", []):
+            if col:
+                col_counter[col] += 1
+
+    if col_counter:
+        # "Method / System" always first; then most-common columns
+        entity_col = "Method / System"
+        ordered = [entity_col] + [
+            col for col, _ in col_counter.most_common()
+            if col != entity_col
+        ]
+        final_headers = ordered
+    else:
+        final_headers = fallback_columns
+
+    rows: list[DraftRow] = []
+    for r in raw_results:
+        label = str(r.get("row_label", "")).strip()
+        if not label:
+            continue
+        raw_cells = r.get("cells", {})
         cells: dict[str, DraftCell] = {}
-        for col in plan_columns:
+        for col in final_headers:
             raw_cell = raw_cells.get(col, {})
             if isinstance(raw_cell, dict):
                 status = raw_cell.get("status", "not_reported")
@@ -578,10 +623,9 @@ async def _compose_single_entity_row(
                 )
             else:
                 cells[col] = DraftCell(value=None, status="not_reported")
-        return DraftRow(row_label=label, cells=cells)
-    except Exception as exc:
-        logger.warning("compose single entity row failed for %s: %s", entity, exc)
-        return None
+        rows.append(DraftRow(row_label=label, cells=cells))
+
+    return final_headers, rows
 
 
 async def compose_result_summary(
@@ -593,10 +637,11 @@ async def compose_result_summary(
     result_summary_plan: ResultSummaryPlan | None = None,
     repair_errors: list[str] | None = None,
 ) -> DraftDataTable:
-    """LLM composer for result_summary mode: one row per method/system.
+    """LLM composer for result_summary mode.
 
-    Runs one LLM call per entity in parallel. Each call receives ALL evidence
-    from that entity's own paper — no char limit, no cross-entity context dilution.
+    One LLM call per entity in parallel. Each call reads its own paper in full
+    and discovers columns from the actual data — no fixed schema imposed.
+    After all calls complete, columns are merged into a unified header list.
     """
     client = AsyncOpenAI(
         api_key=settings.OPENAI_API_KEY,
@@ -605,9 +650,13 @@ async def compose_result_summary(
 
     allowed_ids = _allowed_evidence_ids(plan, evidence_store)
     candidate_rows = plan.candidate_rows or []
-    plan_columns = [c.name for c in plan.columns] if plan.columns else RESULT_SUMMARY_HEADERS
 
-    # Build per-entity evidence lookup (no char limit)
+    # Use fixed columns only for architecture mode (detected by arch-specific column names).
+    # For benchmark/result hints, always discover columns from the data.
+    _ARCH_COL_MARKERS = {"Memory Architecture", "Memory Update / Retrieval", "Key Innovation"}
+    plan_cols = [c.name for c in plan.columns] if plan.columns else []
+    fixed_columns = plan_cols if (_ARCH_COL_MARKERS & set(plan_cols)) else None
+
     doc_blocks: dict[str, list[EvidenceBlock]] = {}
     for b in evidence_store:
         if b.evidence_id not in allowed_ids:
@@ -623,34 +672,30 @@ async def compose_result_summary(
         rsp_guidance = (
             f"\n\nResultSummaryAgent guidance:\n"
             f"- row_groupings (merge these name variants): {groupings}\n"
-            f"- row_grain: {rsp.row_grain}\n"
         )
 
-    # Fire one LLM call per entity in parallel
     tasks = [
         _compose_single_entity_row(
             entity=entity,
             hint=hint,
-            plan_columns=plan_columns,
             entity_evidence=_build_entity_evidence(entity, doc_blocks, all_doc_names),
             rsp_guidance=rsp_guidance,
             repair_errors=repair_errors,
             client=client,
             model=settings.OPENAI_MODEL,
+            fixed_columns=fixed_columns,
         )
         for entity in candidate_rows
     ]
-    results = await asyncio.gather(*tasks)
+    raw_results = await asyncio.gather(*tasks)
+    raw_results = [r for r in raw_results if r is not None]
 
-    rows = [r for r in results if r is not None]
+    final_headers, rows = _align_rows(raw_results, fallback_columns=RESULT_SUMMARY_HEADERS)
+
     if len(rows) > _LLM_MAX_ROWS:
         rows = rows[:_LLM_MAX_ROWS]
 
-    return DraftDataTable(
-        headers=plan_columns,
-        rows=rows,
-        notes=[],
-    )
+    return DraftDataTable(headers=final_headers, rows=rows, notes=[])
 
 
 async def compose_data_table(

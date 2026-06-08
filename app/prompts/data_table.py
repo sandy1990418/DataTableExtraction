@@ -119,38 +119,42 @@ Use the actual metric name from the evidence: "Single-Hop F1", "ROUGE-L", "Accur
 """
 
 TABLE_RESULT_SUMMARY_SYSTEM = """\
-You are summarizing ONE academic paper for a single row in a comparison table.
+You are reading ONE academic paper and extracting results for a comparison table row.
 
 You will receive ALL text and tables from that system's own paper.
-Your job: fill every column for that ONE system using only this paper as the source.
 
-=== COLUMNS ===
-Use exactly the column names specified in "Columns to fill" in the user message.
-- Benchmark / result columns (Representative Result, Best Reported Result, etc.): extract numbers from source tables.
-- Architecture / design columns (Memory Architecture, Key Innovation, etc.): synthesize from paper text in 1-2 sentences.
-- Key Takeaway: one sentence summarizing the system's main contribution or finding.
-- Compared Against: list the baselines from the paper's own experiment tables.
+=== YOUR JOB ===
+1. Look at the paper's tables and text.
+2. Decide what columns are meaningful for this paper — do NOT use a fixed schema.
+3. Extract actual values into those columns.
 
-Return a JSON object:
-{"row": {"row_label": "<system name>", "cells": {<col>: {"value": ..., "status": ..., "evidence_id": ..., "quote": ...}, ...}}}
+=== COLUMN DISCOVERY RULES ===
+Always include "Method / System" as the first column.
+
+Look at the paper's experiment tables and discover relevant columns such as:
+- Dimension columns: "LLM Model" (if the paper tests multiple models), "Dataset", "Task Category"
+- Metric columns: whatever metrics the paper reports (e.g. "F1 Score (%)", "BLEU-1 (%)", "Retrieval Accuracy (%)", "Token Usage (avg)")
+- Context columns: "Compared Against" (baselines listed), "Key Takeaway" (one sentence)
+
+Only add a column if the paper actually has data for it.
+Use the exact metric names from the paper's tables, not generic names.
+
+=== RETURN FORMAT ===
+{
+  "row_label": "<system name>",
+  "discovered_columns": ["Method / System", "LLM Model", "Dataset", "F1 Score (%)", ...],
+  "cells": {
+    "<col>": {"value": <string or null>, "status": <"supported"|"inferred"|"not_reported">, "evidence_id": <id or null>, "quote": <string ≤80 chars or null>}
+  }
+}
 
 === CELL FILLING RULES ===
-
-Architecture / design columns:
-- Read the paper TEXT. Synthesize in 1-2 sentences.
-- status=inferred is acceptable; cite evidence_id with a short phrase.
-- Do NOT say "not_reported" just because no single 80-char quote exists — synthesize.
-
-Benchmark / result columns:
-- Use numbers from the source table in this paper.
-- Be concise: "LoCoMo F1 44.27, Overall 46.47" not every metric.
-
-Key Takeaway:
-- One sentence: what is the main contribution or headline result?
-
-General rules:
-- Only cite evidence_ids that appear in the evidence provided.
-- Quotes ≤80 chars, must appear in evidence text/table.
+- Metric columns: extract exact numbers from source tables. Quote must contain the number.
+- Dimension columns (LLM Model, Dataset): extract from table or surrounding text.
+- "Compared Against": list baseline names from the paper's own comparison tables.
+- "Key Takeaway": one sentence, status=inferred is fine.
+- Missing value: value=null, status="not_reported", evidence_id=null, quote=null.
+- Only cite evidence_ids that appear in the provided evidence.
 - Return compact JSON. No markdown fences.
 """
 

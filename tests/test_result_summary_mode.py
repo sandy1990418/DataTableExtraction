@@ -145,34 +145,28 @@ def test_result_summary_has_no_metric_name_metric_value_columns():
 
 # ── LLM result summary composer ──────────────────────────────────────────────
 
-def _make_single_row_response(row_label: str, rep_result: str, ev_id: str = "ev_1") -> dict:
-    """Per-entity single-row LLM response format used by the new parallel composer."""
+def _make_single_row_response(row_label: str, f1: str, bleu: str, ev_id: str = "ev_1") -> dict:
+    """Per-entity discovered-column response format used by the new parallel composer."""
     return {
-        "row": {
-            "row_label": row_label,
-            "cells": {
-                "Method / System": {"value": row_label, "status": "supported", "evidence_id": ev_id,
-                                    "quote": f"{row_label} achieves"},
-                "Main Benchmark / Task": {"value": "LoCoMo QA", "status": "supported", "evidence_id": ev_id,
-                                          "quote": "Memory Benchmark"},
-                "Representative Result": {"value": rep_result, "status": "supported",
-                                          "evidence_id": ev_id, "quote": rep_result[:60]},
-                "Compared Against": {"value": "MemGPT, MemoryBank, MemoryOS", "status": "inferred",
-                                     "evidence_id": ev_id, "quote": "method=MemGPT"},
-                "Key Takeaway": {"value": f"{row_label} key finding.", "status": "inferred",
-                                 "evidence_id": ev_id, "quote": row_label},
-                "Limitations / Notes": {"value": None, "status": "not_reported", "evidence_id": None, "quote": None},
-            },
-        }
+        "row_label": row_label,
+        "discovered_columns": ["Method / System", "F1 Score (%)", "BLEU-1 (%)", "Compared Against", "Key Takeaway"],
+        "cells": {
+            "Method / System": {"value": row_label, "status": "supported", "evidence_id": ev_id, "quote": row_label},
+            "F1 Score (%)": {"value": f1, "status": "supported", "evidence_id": ev_id, "quote": f1},
+            "BLEU-1 (%)": {"value": bleu, "status": "supported", "evidence_id": ev_id, "quote": bleu},
+            "Compared Against": {"value": "MemGPT, MemoryBank, MemoryOS", "status": "inferred",
+                                 "evidence_id": ev_id, "quote": "MemGPT"},
+            "Key Takeaway": {"value": f"{row_label} key finding.", "status": "inferred",
+                             "evidence_id": ev_id, "quote": row_label},
+        },
     }
 
 
 @pytest.fixture
 def llm_result_summary_response():
-    # Two per-entity responses (one per candidate row in _summary_plan)
     return [
-        _make_single_row_response("A-MEM", "Overall 46.47; Multi-Hop F1 44.27"),
-        _make_single_row_response("MemGPT", "Overall 1.84; Single-Hop F1 1.18"),
+        _make_single_row_response("A-MEM", "44.27", "20.09"),
+        _make_single_row_response("MemGPT", "1.18", "0.01"),
     ]
 
 
@@ -208,7 +202,7 @@ async def test_compose_result_summary_calls_llm_not_long_form(llm_result_summary
 
     assert mock_client.chat.completions.create.call_count == 2  # one per candidate row
     assert len(draft.rows) == 2
-    assert draft.headers == RESULT_SUMMARY_HEADERS
+    assert "Method / System" in draft.headers
 
 
 @pytest.mark.asyncio
@@ -236,8 +230,8 @@ async def test_compose_result_summary_row_grain_is_method_level(llm_result_summa
 
 
 @pytest.mark.asyncio
-async def test_compose_result_summary_representative_result_is_composite(llm_result_summary_response):
-    """Representative Result cell must be a string containing a number."""
+async def test_compose_result_summary_f1_cell_has_number(llm_result_summary_response):
+    """Discovered metric column must contain a numeric value."""
     block = _make_block()
     plan = _summary_plan()
 
@@ -254,15 +248,14 @@ async def test_compose_result_summary_representative_result_is_composite(llm_res
         draft = await compose_result_summary("Compare memory results", plan, [block], [], settings)
 
     amem_row = next(r for r in draft.rows if r.row_label == "A-MEM")
-    rep = amem_row.cells.get("Representative Result")
-    assert rep is not None
-    assert isinstance(rep.value, str)
-    assert any(c.isdigit() for c in (rep.value or ""))
+    f1_cell = amem_row.cells.get("F1 Score (%)")
+    assert f1_cell is not None
+    assert any(c.isdigit() for c in str(f1_cell.value or ""))
 
 
 @pytest.mark.asyncio
-async def test_compose_result_summary_headers_from_plan_columns(llm_result_summary_response):
-    """Headers are taken from plan.columns, not from individual LLM responses."""
+async def test_compose_result_summary_headers_discovered_from_data(llm_result_summary_response):
+    """Headers are discovered from the LLM responses, not taken from a fixed schema."""
     block = _make_block()
     plan = _summary_plan()
 
@@ -278,7 +271,9 @@ async def test_compose_result_summary_headers_from_plan_columns(llm_result_summa
 
         draft = await compose_result_summary("Compare memory results", plan, [block], [], settings)
 
-    assert draft.headers == RESULT_SUMMARY_HEADERS
+    # Headers should be discovered from data, not the fixed RESULT_SUMMARY_HEADERS
+    assert "Method / System" in draft.headers
+    assert "F1 Score (%)" in draft.headers
     assert len(draft.headers) >= 3
 
 
