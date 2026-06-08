@@ -118,41 +118,48 @@ NEVER use vague names like "Primary Metric 1", "Metric 2", "Score 1".
 Use the actual metric name from the evidence: "Single-Hop F1", "ROUGE-L", "Accuracy".
 """
 
+DISCOVER_COLUMNS_SYSTEM = """You are designing a unified column schema for a comparison table across multiple academic papers.
+
+You will receive summaries of all papers' tables (headers, sample rows) and text previews.
+
+Your job: design 5-8 columns that:
+1. Start with "Method / System" (always first)
+2. Are meaningful for the user's hint
+3. Can be filled (even partially) by most papers
+4. Use normalized names across papers:
+   - F1 scores → "F1 Score (%)"
+   - BLEU scores → "BLEU-1 (%)"
+   - Retrieval/memory accuracy → "Accuracy (%)"
+   - Token count/usage → "Token Usage (avg)"
+   - Dataset/benchmark name → "Dataset"
+   - LLM model used → "Underlying LLM"
+5. Include "Compared Against" and "Key Takeaway" as last columns
+
+Return: {"columns": ["Method / System", ...]}
+No markdown fences.
+"""
+
 TABLE_RESULT_SUMMARY_SYSTEM = """\
-You are reading ONE academic paper and extracting results for a comparison table row.
+You are extracting results from ONE academic paper into a single table row.
 
 You will receive ALL text and tables from that system's own paper.
+You will also receive a fixed list of columns to fill ("Columns to fill" in the user message).
 
 === YOUR JOB ===
-1. Look at the paper's tables and text.
-2. Decide what columns are meaningful for this paper — do NOT use a fixed schema.
-3. Extract actual values into those columns.
+Fill every column using only this paper's evidence. Do NOT invent values.
 
 === COLUMN DISCOVERY RULES ===
-Always include "Method / System" as the first column.
-
-Look at the paper's experiment tables and discover relevant columns such as:
-- Dimension columns: "LLM Model" (if the paper tests multiple models), "Dataset", "Task Category"
-- Metric columns: whatever metrics the paper reports (e.g. "F1 Score (%)", "BLEU-1 (%)", "Retrieval Accuracy (%)", "Token Usage (avg)")
-- Context columns: "Compared Against" (baselines listed), "Key Takeaway" (one sentence)
-
-Only add a column if the paper actually has data for it.
-Use the exact metric names from the paper's tables, not generic names.
+Use exactly the columns listed in "Columns to fill" in the user message. Do not invent new columns.
 
 === RETURN FORMAT ===
-{
-  "row_label": "<system name>",
-  "discovered_columns": ["Method / System", "LLM Model", "Dataset", "F1 Score (%)", ...],
-  "cells": {
-    "<col>": {"value": <string or null>, "status": <"supported"|"inferred"|"not_reported">, "evidence_id": <id or null>, "quote": <string ≤80 chars or null>}
-  }
-}
+{"row_label": "<system name>", "cells": {"<col>": {"value": <string or null>, "status": <"supported"|"inferred"|"not_reported">, "evidence_id": <id or null>, "quote": <string ≤80 chars or null>}}}
 
 === CELL FILLING RULES ===
-- Metric columns: extract exact numbers from source tables. Quote must contain the number.
-- Dimension columns (LLM Model, Dataset): extract from table or surrounding text.
+- Metric columns (F1 Score, BLEU-1, Accuracy, Token Usage...): extract exact numbers from source tables. Quote must contain the number.
+- "Dataset": name of the benchmark/dataset used in the paper's main experiment.
+- "Underlying LLM": which LLM model(s) the paper uses (e.g. GPT-4o-mini, LLaMA).
 - "Compared Against": list baseline names from the paper's own comparison tables.
-- "Key Takeaway": one sentence, status=inferred is fine.
+- "Key Takeaway": one sentence summary of main contribution, status=inferred is fine.
 - Missing value: value=null, status="not_reported", evidence_id=null, quote=null.
 - Only cite evidence_ids that appear in the provided evidence.
 - Return compact JSON. No markdown fences.

@@ -13,7 +13,7 @@ from pydantic import BaseModel
 
 from app.config import Settings
 from app.models.data_table import EvidenceBlock
-from app.prompts.data_table import TABLE_COMPOSER_SYSTEM, TABLE_RESULT_SUMMARY_SYSTEM
+from app.prompts.data_table import DISCOVER_COLUMNS_SYSTEM, TABLE_COMPOSER_SYSTEM, TABLE_RESULT_SUMMARY_SYSTEM
 from app.services.data_table.source_table_rows import (
     extract_source_table_candidates,
     parse_markdown_table,
@@ -513,6 +513,66 @@ def _build_entity_evidence(
     return "\n".join(section_lines)
 
 
+async def _discover_unified_columns(
+    hint: str,
+    evidence_store: list[EvidenceBlock],
+    source_table_summaries: list[SourceTableSummary],
+    client: AsyncOpenAI,
+    model: str,
+) -> list[str]:
+    """Phase 1: one LLM call across all papers to decide a unified column schema.
+
+    Looks at table headers + sample rows + text previews from all papers,
+    then returns a normalized column list that can be filled across most papers.
+    """
+    # Build compact cross-paper summary
+    lines: list[str] = []
+    ev_text: dict[str, str] = {}
+    for b in evidence_store:
+        if b.text and b.evidence_id not in ev_text:
+            ev_text[b.evidence_id] = (b.text or "")[:200].replace("\n", " ")
+
+    for s in source_table_summaries:
+        sample = "; ".join(" | ".join(r) for r in s.sample_rows[:3])
+        text_preview = ev_text.get(s.evidence_id, "")
+        lines.append(
+            f"[{s.evidence_id}] {s.title or s.table_id} — headers: {s.headers} | sample: {sample}"
+            + (f" | text: {text_preview}" if text_preview else "")
+        )
+
+    # Also include text-only blocks (no table) for context
+    for b in evidence_store:
+        if not b.table_markdown and b.text:
+            lines.append(f"[{b.evidence_id}] {b.document_name or ''} {b.title or ''}: {(b.text or '')[:200].replace(chr(10), ' ')}")
+
+    user_msg = (
+        f"User hint: {hint}\n\n"
+        f"Papers available:\n" + "\n".join(lines) +
+        "\n\nDesign a unified column schema for these papers. Return JSON: {\"columns\": [...]}"
+    )
+
+    try:
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": DISCOVER_COLUMNS_SYSTEM},
+                {"role": "user", "content": user_msg},
+            ],
+            max_completion_tokens=256,
+            temperature=0.0,
+            response_format={"type": "json_object"},
+        )
+        raw = response.choices[0].message.content or "{}"
+        data = json.loads(raw)
+        cols = data.get("columns", [])
+        if isinstance(cols, list) and cols:
+            return [str(c) for c in cols if c]
+    except Exception as exc:
+        logger.warning("_discover_unified_columns failed: %s", exc)
+
+    return RESULT_SUMMARY_HEADERS
+
+
 async def _compose_single_entity_row(
     entity: str,
     hint: str,
@@ -632,7 +692,7 @@ async def compose_result_summary(
     hint: str,
     plan: DataTablePlan,
     evidence_store: list[EvidenceBlock],
-    source_table_summaries: list[SourceTableSummary],  # noqa: ARG001
+    source_table_summaries: list[SourceTableSummary],
     settings: Settings,
     result_summary_plan: ResultSummaryPlan | None = None,
     repair_errors: list[str] | None = None,
@@ -652,10 +712,17 @@ async def compose_result_summary(
     candidate_rows = plan.candidate_rows or []
 
     # Use fixed columns only for architecture mode (detected by arch-specific column names).
-    # For benchmark/result hints, always discover columns from the data.
+    # For benchmark/result hints, discover unified schema from all papers (Phase 1).
     _ARCH_COL_MARKERS = {"Memory Architecture", "Memory Update / Retrieval", "Key Innovation"}
     plan_cols = [c.name for c in plan.columns] if plan.columns else []
-    fixed_columns = plan_cols if (_ARCH_COL_MARKERS & set(plan_cols)) else None
+    if _ARCH_COL_MARKERS & set(plan_cols):
+        # Architecture mode: use plan columns
+        fixed_columns = plan_cols
+    else:
+        # Benchmark/result mode: discover unified schema from all papers
+        fixed_columns = await _discover_unified_columns(
+            hint, evidence_store, source_table_summaries, client, settings.OPENAI_MODEL
+        )
 
     doc_blocks: dict[str, list[EvidenceBlock]] = {}
     for b in evidence_store:
@@ -690,12 +757,12 @@ async def compose_result_summary(
     raw_results = await asyncio.gather(*tasks)
     raw_results = [r for r in raw_results if r is not None]
 
-    final_headers, rows = _align_rows(raw_results, fallback_columns=RESULT_SUMMARY_HEADERS)
+    _, rows = _align_rows(raw_results, fallback_columns=fixed_columns)
 
     if len(rows) > _LLM_MAX_ROWS:
         rows = rows[:_LLM_MAX_ROWS]
 
-    return DraftDataTable(headers=final_headers, rows=rows, notes=[])
+    return DraftDataTable(headers=fixed_columns, rows=rows, notes=[])
 
 
 async def compose_data_table(
