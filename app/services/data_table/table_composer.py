@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from openai import AsyncOpenAI
 from pydantic import BaseModel
@@ -19,6 +20,9 @@ from app.services.data_table.source_table_rows import (
 )
 from app.services.data_table.source_table_summary import SourceTableSummary
 from app.services.data_table.table_planner import RESULT_SUMMARY_HEADERS, DataTablePlan
+
+if TYPE_CHECKING:
+    from app.services.data_table.result_summary_agent import ResultSummaryPlan
 
 logger = logging.getLogger(__name__)
 
@@ -434,22 +438,91 @@ def _format_text_for_summary(
     return "\n".join(lines) or "(no text evidence)"
 
 
-async def compose_result_summary(
+def _normalize_name(name: str) -> str:
+    """Normalize entity/document name for fuzzy matching."""
+    return re.sub(r"[\s\-_\.]+", "", name.lower())
+
+
+def _match_entity_to_document(entity: str, doc_names: list[str]) -> str | None:
+    """Find which document name best matches an entity name."""
+    ent_norm = _normalize_name(entity)
+    # Strip file extension from document names for matching
+    for doc in doc_names:
+        doc_stem = re.sub(r"\.(md|pdf|txt)$", "", doc, flags=re.IGNORECASE)
+        if _normalize_name(doc_stem) == ent_norm:
+            return doc
+    # Substring match: entity contained in doc stem or vice versa
+    for doc in doc_names:
+        doc_stem = re.sub(r"\.(md|pdf|txt)$", "", doc, flags=re.IGNORECASE)
+        doc_norm = _normalize_name(doc_stem)
+        if ent_norm in doc_norm or doc_norm in ent_norm:
+            return doc
+    return None
+
+
+_RESULTS_SECTION_RE = re.compile(
+    r"result|experiment|evaluat|benchmark|performance|ablat|comparison|metric|table",
+    re.IGNORECASE,
+)
+
+
+def _is_results_block(b: EvidenceBlock) -> bool:
+    title = b.title or ""
+    text_head = (b.text or "")[:120]
+    return bool(_RESULTS_SECTION_RE.search(title) or _RESULTS_SECTION_RE.search(text_head))
+
+
+def _build_entity_evidence(
+    entity: str,
+    doc_blocks: dict[str, list[EvidenceBlock]],
+    all_doc_names: list[str],
+) -> str:
+    """Return the full evidence string for a single entity.
+
+    All blocks from the matched document are included — no char limit.
+    Results/experiment blocks are sorted to the top so the LLM sees them first.
+    """
+    matched_doc = _match_entity_to_document(entity, all_doc_names)
+    if matched_doc is None:
+        return f"--- {entity} (no matched document) ---\n(No direct paper evidence found.)"
+
+    blocks = doc_blocks[matched_doc]
+
+    # Sort: tables first, then results-section text, then other text
+    table_blocks = [b for b in blocks if b.table_markdown]
+    result_text_blocks = [b for b in blocks if not b.table_markdown and _is_results_block(b)]
+    other_text_blocks = [b for b in blocks if not b.table_markdown and not _is_results_block(b)]
+    ordered = table_blocks + result_text_blocks + other_text_blocks
+
+    section_lines = [f"--- {entity} (document: {matched_doc}) ---"]
+
+    table_added = False
+    for b in ordered:
+        if b.table_markdown and not table_added:
+            section_lines.append("Source table (from this system's own paper):")
+            section_lines.append(f"  [{b.evidence_id}] {b.title or 'Table'}\n{b.table_markdown}")
+            table_added = True
+        elif b.text:
+            if not table_added and not any("Paper text" in l for l in section_lines):
+                # haven't seen a table yet, start text section
+                pass
+            text = (b.text or "").strip()
+            section_lines.append(f"  [{b.evidence_id}] {b.title or ''}: {text}")
+
+    return "\n".join(section_lines)
+
+
+async def _compose_single_entity_row(
+    entity: str,
     hint: str,
-    plan: DataTablePlan,
-    evidence_store: list[EvidenceBlock],
-    source_table_summaries: list[SourceTableSummary],  # noqa: ARG001
-    settings: Settings,
-    repair_errors: list[str] | None = None,
-) -> DraftDataTable:
-    """LLM composer for result_summary mode: one row per method/system."""
-    client = AsyncOpenAI(
-        api_key=settings.OPENAI_API_KEY,
-        base_url=settings.OPENAI_BASE_URL or None,
-    )
-
-    allowed_ids = _allowed_evidence_ids(plan, evidence_store)
-
+    plan_columns: list[str],
+    entity_evidence: str,
+    rsp_guidance: str,
+    repair_errors: list[str] | None,
+    client: AsyncOpenAI,
+    model: str,
+) -> DraftRow | None:
+    """Call the LLM once for a single entity row. Returns None on failure."""
     repair_section = ""
     if repair_errors:
         repair_section = (
@@ -460,40 +533,124 @@ async def compose_result_summary(
 
     user_msg = (
         f"User hint: {hint}\n\n"
-        f"Source tables:\n{_format_source_tables_for_summary(evidence_store, allowed_ids)}\n\n"
-        f"Text evidence:\n{_format_text_for_summary(evidence_store, allowed_ids)}"
+        f"Columns to fill: {plan_columns}\n"
+        f"Row to produce: {entity}\n\n"
+        f"=== Evidence from {entity}'s own paper ===\n"
+        f"Use this as the PRIMARY source. Do NOT rely on another paper's comparison table.\n\n"
+        f"{entity_evidence}"
+        f"{rsp_guidance}"
         f"{repair_section}\n\n"
-        "Return compact JSON only. No markdown fences."
+        "Return a JSON object with a single 'row' key:\n"
+        '{"row": {"row_label": "<entity>", "cells": {<col>: {"value": ..., "status": ..., "evidence_id": ..., "quote": ...}, ...}}}\n'
+        "No markdown fences."
     )
 
     try:
         response = await client.chat.completions.create(
-            model=settings.OPENAI_MODEL,
+            model=model,
             messages=[
                 {"role": "system", "content": TABLE_RESULT_SUMMARY_SYSTEM},
                 {"role": "user", "content": user_msg},
             ],
-            max_completion_tokens=4096,
+            max_completion_tokens=1024,
             temperature=0.0,
             response_format={"type": "json_object"},
         )
         raw = response.choices[0].message.content or "{}"
         data = json.loads(raw)
-        draft = _parse_draft(data, plan)
-        # ensure headers are the standard result_summary schema
-        if not draft.headers or draft.headers != RESULT_SUMMARY_HEADERS:
-            draft.headers = RESULT_SUMMARY_HEADERS
-        # cap rows
-        if len(draft.rows) > _LLM_MAX_ROWS:
-            draft.rows = draft.rows[:_LLM_MAX_ROWS]
-        return draft
+
+        # Accept both {"row": {...}} and direct row object formats
+        raw_row = data.get("row") or data
+        label = str(raw_row.get("row_label", entity)).strip() or entity
+        raw_cells = raw_row.get("cells", {})
+        cells: dict[str, DraftCell] = {}
+        for col in plan_columns:
+            raw_cell = raw_cells.get(col, {})
+            if isinstance(raw_cell, dict):
+                status = raw_cell.get("status", "not_reported")
+                if status not in ("supported", "not_reported", "conflicting", "inferred"):
+                    status = "not_reported"
+                cells[col] = DraftCell(
+                    value=raw_cell.get("value"),
+                    status=status,  # type: ignore[arg-type]
+                    evidence_id=raw_cell.get("evidence_id") or None,
+                    quote=raw_cell.get("quote") or None,
+                )
+            else:
+                cells[col] = DraftCell(value=None, status="not_reported")
+        return DraftRow(row_label=label, cells=cells)
     except Exception as exc:
-        logger.warning("compose_result_summary LLM call failed: %s", exc)
-        return DraftDataTable(
-            headers=RESULT_SUMMARY_HEADERS,
-            rows=[],
-            notes=[f"Result summary composition failed: {exc}"],
+        logger.warning("compose single entity row failed for %s: %s", entity, exc)
+        return None
+
+
+async def compose_result_summary(
+    hint: str,
+    plan: DataTablePlan,
+    evidence_store: list[EvidenceBlock],
+    source_table_summaries: list[SourceTableSummary],  # noqa: ARG001
+    settings: Settings,
+    result_summary_plan: ResultSummaryPlan | None = None,
+    repair_errors: list[str] | None = None,
+) -> DraftDataTable:
+    """LLM composer for result_summary mode: one row per method/system.
+
+    Runs one LLM call per entity in parallel. Each call receives ALL evidence
+    from that entity's own paper — no char limit, no cross-entity context dilution.
+    """
+    client = AsyncOpenAI(
+        api_key=settings.OPENAI_API_KEY,
+        base_url=settings.OPENAI_BASE_URL or None,
+    )
+
+    allowed_ids = _allowed_evidence_ids(plan, evidence_store)
+    candidate_rows = plan.candidate_rows or []
+    plan_columns = [c.name for c in plan.columns] if plan.columns else RESULT_SUMMARY_HEADERS
+
+    # Build per-entity evidence lookup (no char limit)
+    doc_blocks: dict[str, list[EvidenceBlock]] = {}
+    for b in evidence_store:
+        if b.evidence_id not in allowed_ids:
+            continue
+        name = b.document_name or b.source_id or "(unknown)"
+        doc_blocks.setdefault(name, []).append(b)
+    all_doc_names = list(doc_blocks.keys())
+
+    rsp_guidance = ""
+    if result_summary_plan is not None:
+        rsp = result_summary_plan
+        groupings = "; ".join(" = ".join(g) for g in rsp.row_groupings) if rsp.row_groupings else "(none)"
+        rsp_guidance = (
+            f"\n\nResultSummaryAgent guidance:\n"
+            f"- row_groupings (merge these name variants): {groupings}\n"
+            f"- row_grain: {rsp.row_grain}\n"
         )
+
+    # Fire one LLM call per entity in parallel
+    tasks = [
+        _compose_single_entity_row(
+            entity=entity,
+            hint=hint,
+            plan_columns=plan_columns,
+            entity_evidence=_build_entity_evidence(entity, doc_blocks, all_doc_names),
+            rsp_guidance=rsp_guidance,
+            repair_errors=repair_errors,
+            client=client,
+            model=settings.OPENAI_MODEL,
+        )
+        for entity in candidate_rows
+    ]
+    results = await asyncio.gather(*tasks)
+
+    rows = [r for r in results if r is not None]
+    if len(rows) > _LLM_MAX_ROWS:
+        rows = rows[:_LLM_MAX_ROWS]
+
+    return DraftDataTable(
+        headers=plan_columns,
+        rows=rows,
+        notes=[],
+    )
 
 
 async def compose_data_table(
@@ -502,6 +659,7 @@ async def compose_data_table(
     evidence_store: list[EvidenceBlock],
     source_table_summaries: list[SourceTableSummary],
     settings: Settings,
+    result_summary_plan: ResultSummaryPlan | None = None,
     repair_errors: list[str] | None = None,
 ) -> DraftDataTable:
     client = AsyncOpenAI(
@@ -523,12 +681,25 @@ async def compose_data_table(
             + "\n"
         )
 
+    rsp_guidance = ""
+    if result_summary_plan is not None:
+        rsp = result_summary_plan
+        must = ", ".join(rsp.must_include) if rsp.must_include else "(none)"
+        excl = ", ".join(rsp.exclude_as_rows) if rsp.exclude_as_rows else "(none)"
+        rsp_guidance = (
+            f"\n\nResultSummaryAgent guidance:\n"
+            f"- PRIMARY SYSTEMS to compare (these MUST be rows): {must}\n"
+            f"- DO NOT create rows for these (they are datasets/baselines): {excl}\n"
+            f"- row_grain: {rsp.row_grain}\n"
+        )
+
     user_msg = (
         f"User hint: {hint}\n\n"
         f"Table plan:\n{_format_plan(plan)}\n\n"
         f"Source table summaries (allowed):\n{_format_summaries(source_table_summaries, allowed_ids)}\n\n"
         f"Evidence:\n{_format_evidence(evidence_store, allowed_ids)}"
-        f"{repair_section}\n\n"
+        f"{repair_section}"
+        f"{rsp_guidance}\n\n"
         f"HARD LIMITS: max {max_rows} rows, max {max_cells} total cells.\n"
         "For each cell use short quote (≤60 chars). Return compact JSON only. No markdown fences."
     )

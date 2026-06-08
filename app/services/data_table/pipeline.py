@@ -13,6 +13,7 @@ from app.models.data_table import (
 from app.services.data_table.evidence_store import build_evidence_store
 from app.services.data_table.exporters import compute_table_metrics
 from app.services.data_table.source_table_summary import summarize_source_tables
+from app.services.data_table.result_summary_agent import ResultSummaryPlan, run_result_summary_agent
 from app.services.data_table.table_composer import (
     RESULT_SUMMARY_HEADERS,
     build_draft_from_source_table,
@@ -68,8 +69,17 @@ async def generate_data_table(
         "tables": [s.model_dump() for s in source_table_summaries],
     })
 
+    # Stage 2b: ResultSummaryAgent — paper-level understanding before planning
+    result_summary_plan: ResultSummaryPlan | None = await run_result_summary_agent(
+        hint, evidence_store, source_table_summaries, settings, debug_trace=debug_trace
+    )
+
     # Stage 3: LLM table planner
-    plan = await plan_data_table(hint, evidence_store, source_table_summaries, settings, debug_trace=debug_trace)
+    plan = await plan_data_table(
+        hint, evidence_store, source_table_summaries, settings,
+        result_summary_plan=result_summary_plan,
+        debug_trace=debug_trace,
+    )
     debug_trace.append({
         "stage": "table_planning",
         "table_purpose_type": plan.table_purpose_type,
@@ -105,7 +115,10 @@ async def generate_data_table(
     draft = None
 
     if plan.table_purpose_type == "result_summary" and not is_fallback_plan:
-        draft = await compose_result_summary(hint, plan, evidence_store, source_table_summaries, settings)
+        draft = await compose_result_summary(
+            hint, plan, evidence_store, source_table_summaries, settings,
+            result_summary_plan=result_summary_plan,
+        )
         debug_trace.append({
             "stage": "table_composition",
             "method": "llm_result_summary",
@@ -136,7 +149,7 @@ async def generate_data_table(
             })
 
     if draft is None:
-        draft = await compose_data_table(hint, plan, evidence_store, source_table_summaries, settings)
+        draft = await compose_data_table(hint, plan, evidence_store, source_table_summaries, settings, result_summary_plan=result_summary_plan)
         debug_trace.append({
             "stage": "table_composition",
             "method": "llm_composer",
@@ -163,6 +176,10 @@ async def generate_data_table(
         c for c in plan.candidate_rows
         if c.lower() not in produced_labels_lower and c.lower() not in excluded_labels_lower
     ]
+    # Only repair rows the agent identified as primary systems
+    if result_summary_plan and result_summary_plan.must_include:
+        must_inc_lower = {m.lower() for m in result_summary_plan.must_include}
+        missing_candidates = [c for c in missing_candidates if c.lower() in must_inc_lower]
     if candidate_count > 0 and len(missing_candidates) > candidate_count * 0.5 and not is_fallback_plan:
         logger.info(
             "Coverage gap: %d/%d candidates produced, triggering coverage repair",
@@ -174,6 +191,7 @@ async def generate_data_table(
         if plan.table_purpose_type == "result_summary":
             coverage_draft = await compose_result_summary(
                 hint, plan, evidence_store, source_table_summaries, settings,
+                result_summary_plan=result_summary_plan,
                 repair_errors=coverage_errors,
             )
         else:
@@ -203,6 +221,7 @@ async def generate_data_table(
         if plan.table_purpose_type == "result_summary" and not is_fallback_plan:
             repaired_draft = await compose_result_summary(
                 hint, plan, evidence_store, source_table_summaries, settings,
+                result_summary_plan=result_summary_plan,
                 repair_errors=severe_errors,
             )
         else:

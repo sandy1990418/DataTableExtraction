@@ -119,46 +119,38 @@ Use the actual metric name from the evidence: "Single-Hop F1", "ROUGE-L", "Accur
 """
 
 TABLE_RESULT_SUMMARY_SYSTEM = """\
-You are summarizing experimental results for a human reader in the style of NotebookLM.
+You are summarizing ONE academic paper for a single row in a comparison table.
 
-Your output is a concise comparison table: ONE ROW PER METHOD / SYSTEM.
-Do NOT produce one row per metric. Summarize multiple metrics in a single cell.
+You will receive ALL text and tables from that system's own paper.
+Your job: fill every column for that ONE system using only this paper as the source.
 
-Return a JSON object with:
-- headers: exactly ["Method / System", "Main Benchmark / Task", "Representative Result", "Compared Against", "Key Takeaway", "Limitations / Notes", "Sources"]
-- rows: list of row objects, each with:
-  - row_label: the method or system name
-  - cells: dict mapping each header to a cell object with:
-    - value: the cell value as a string (or null)
-    - status: one of supported, not_reported, inferred
-    - evidence_id: evidence_id that supports this cell (required if status != not_reported)
-    - quote: a SHORT quote from the evidence (≤80 chars) that supports the value
-- notes: list of brief notes about the table
+=== COLUMNS ===
+Use exactly the column names specified in "Columns to fill" in the user message.
+- Benchmark / result columns (Representative Result, Best Reported Result, etc.): extract numbers from source tables.
+- Architecture / design columns (Memory Architecture, Key Innovation, etc.): synthesize from paper text in 1-2 sentences.
+- Key Takeaway: one sentence summarizing the system's main contribution or finding.
+- Compared Against: list the baselines from the paper's own experiment tables.
 
-Rules for "Representative Result":
-- Pick the most headline-worthy result: best score, average across tasks, improvement over baseline.
-- Summarize multiple related metrics in one string, e.g. "Multi-Hop F1/BLEU 27.02/20.09; Temporal F1 45.85"
-- Keep the string concise. Do NOT list every metric individually.
-- The quote must contain at least one of the key numbers.
+Return a JSON object:
+{"row": {"row_label": "<system name>", "cells": {<col>: {"value": ..., "status": ..., "evidence_id": ..., "quote": ...}, ...}}}
 
-Rules for "Compared Against":
-- List the main baselines this system is compared against (comma-separated names).
-- Use status=inferred if derived from reading the table context.
+=== CELL FILLING RULES ===
 
-Rules for "Key Takeaway":
-- One sentence describing the most important finding for this system.
-- Can use status=inferred with a supporting quote.
-- Must reference the evidence; do NOT invent claims.
+Architecture / design columns:
+- Read the paper TEXT. Synthesize in 1-2 sentences.
+- status=inferred is acceptable; cite evidence_id with a short phrase.
+- Do NOT say "not_reported" just because no single 80-char quote exists — synthesize.
 
-Rules for "Limitations / Notes":
-- Brief note on caveats, model settings, or missing benchmarks.
-- Use status=not_reported if nothing relevant found.
+Benchmark / result columns:
+- Use numbers from the source table in this paper.
+- Be concise: "LoCoMo F1 44.27, Overall 46.47" not every metric.
+
+Key Takeaway:
+- One sentence: what is the main contribution or headline result?
 
 General rules:
-- One row per method/system. Do NOT split a method into multiple rows.
-- Only cite evidence_ids that were provided.
-- Quotes must be ≤80 chars and appear in the evidence text or table.
-- Do not output rows for methods with no evidence.
+- Only cite evidence_ids that appear in the evidence provided.
+- Quotes ≤80 chars, must appear in evidence text/table.
 - Return compact JSON. No markdown fences.
 """
 
@@ -191,6 +183,17 @@ Critical rules:
 Notes column rules:
 - Every Notes cell must have a citation (evidence_id + quote).
 - If you cannot find supporting text, use status=not_reported and null value instead.
+
+=== CROSS-DOCUMENT SYNTHESIS (for system_comparison) ===
+
+When the table compares systems from different submitted documents:
+- Each submitted document IS the paper about that system. AMem.md = the A-MEM paper.
+- A cell value may synthesize information from the system's own paper.
+- Use status=inferred when combining information from multiple evidence blocks.
+- For architectural properties (e.g. "hierarchical memory", "graph-based retrieval"),
+  a one-sentence synthesis from the paper is acceptable without a single exact quote.
+- Do NOT leave cells empty just because a single 80-char quote doesn't exist.
+  Synthesize from the document text and cite the evidence_id with a short paraphrase.
 """
 
 CELL_FILL_SYSTEM = """\
@@ -221,4 +224,37 @@ Rules:
 - For boolean values, the quote must justify Yes/No.
 - If multiple sources conflict, use status conflicting and include all conflicting citations.
 - Do NOT generate the entire table. Only fill the single cell described.
+"""
+
+RESULT_SUMMARY_AGENT_SYSTEM = """\
+You are a paper-reading assistant that produces a ResultSummaryPlan — NOT a table.
+
+You receive the output of 7 structured inspection steps about academic papers and their result tables.
+Your job: act like a careful human reader who identifies what the key methods/systems are,
+distinguishes them from datasets/baselines, and decides what should be rows in a comparison table.
+
+Return a JSON object with:
+- row_grain: always "method / system" for result-summary requests
+- columns: ordered list of column headers (default: ["Method / System", "Main Benchmark / Task",
+  "Representative Result", "Compared Against", "Key Takeaway", "Notes", "Sources"])
+- must_include: list of method/system names that MUST become rows (confirmed by evidence)
+- exclude_as_rows: list of labels that are datasets, benchmarks, or evaluation tasks — NOT rows
+- baseline_labels: list of names that are baselines only (not the proposed system)
+- table_classifications: dict of table_id → "main_result" | "ablation" | "efficiency" | "external"
+- representative_metrics: dict of method_name → one-line description of their headline metric
+- row_groupings: list of lists — groups of name variants that should be merged into one row
+  e.g. [["A-MEM", "AMEM", "A-MEM (ours)"]] → merged as "A-MEM"
+- notes: list of brief observations about the evidence
+
+Critical rules:
+- DO NOT generate the table itself. Only produce the plan.
+- must_include should contain only method/system names that appear as PRIMARY subjects in at least one document.
+  A method is primary if a paper is ABOUT that method, not merely citing it as a baseline.
+- Dataset/benchmark labels like LOCOMO, LongMemEval, MemGPT-Bench are evaluation sets — put them in exclude_as_rows.
+- If the hint says "compare memory experiment results", the rows should be memory systems
+  (A-MEM, MemGPT, MemoryBank, MemoryOS, etc.), not evaluation tasks or datasets.
+- Baselines mentioned only in comparison tables (not as paper topics) belong in baseline_labels.
+- Prefer main_result tables over ablation/efficiency tables for row discovery.
+- If evidence is ambiguous, prefer including a method in must_include rather than excluding it.
+- Return compact JSON. No markdown fences. No explanation outside JSON.
 """

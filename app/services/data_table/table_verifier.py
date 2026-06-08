@@ -34,6 +34,13 @@ _CONTEXT_SUPPORT_COLS = frozenset({
 _SOFT_COLS = frozenset({
     "Key Takeaway",
     "Limitations / Notes",
+    "Notes",
+    "Architecture",
+    "Design",
+    "Memory Design",
+    "Key Innovation",
+    "Approach",
+    "Description",
 })
 
 # Role lookup for result-summary column names
@@ -115,8 +122,9 @@ def _build_grounded_cell(
 
     citations: list[CellCitation] = []
 
-    # inferred cells in soft columns: accept without strict quote check
-    if status == "inferred" and col_name in _SOFT_COLS:
+    # inferred cells: accept without strict quote check for soft columns OR non-metric columns
+    col_role = _infer_role_from_name(col_name)
+    if status == "inferred" and (col_name in _SOFT_COLS or col_role != "metric"):
         if ev_id and ev_id in evidence_index and quote:
             citations.append(CellCitation(
                 source_ref=evidence_index[ev_id].source_ref,
@@ -271,7 +279,8 @@ def verify_draft_table(
             empty_ratio = sum(
                 1 for c in all_data_cells if c.status in ("not_reported", "unsupported")
             ) / len(all_data_cells)
-            if empty_ratio > 0.3:
+            threshold = 0.5 if plan.table_purpose_type == "system_comparison" else 0.35
+            if empty_ratio > threshold:
                 warnings.append(
                     f"{empty_ratio:.0%} of cells are empty or unsupported. "
                     "Evidence may not cover the requested table."

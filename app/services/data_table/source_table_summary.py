@@ -21,6 +21,11 @@ _GRAIN_HINTS: list[tuple[list[str], str]] = [
     (["ablation", "variant", "configuration", "setting"], "ablation_variant"),
 ]
 
+# Header names that indicate a backbone/base-model column (not the true method grain).
+_BASE_MODEL_HEADERS = {"model", "base model", "llm", "backbone", "base_model", "lm"}
+# Header names that indicate the actual method/system column.
+_METHOD_HEADERS = {"method", "system", "approach", "algorithm", "strategy", "memory"}
+
 RowGrain = Literal[
     "base_model_plus_method",
     "memory_system",
@@ -48,6 +53,23 @@ class SourceTableSummary(BaseModel):
 
 def _normalize(text: str) -> str:
     return re.sub(r"[\s\-_]+", "", text.lower())
+
+
+def _row_label_column_index(headers: list[str]) -> int:
+    """
+    Return the column index that contains the actual row-grain labels.
+
+    For tables like  Model | Method | F1 | BLEU  the first column is a base
+    model (backbone LLM), while the second column holds the actual memory
+    method/system being compared.  Return 1 in that case; return 0 otherwise.
+    """
+    if len(headers) < 2:
+        return 0
+    h0 = headers[0].strip().lower()
+    h1 = headers[1].strip().lower()
+    if h0 in _BASE_MODEL_HEADERS and h1 in _METHOD_HEADERS:
+        return 1
+    return 0
 
 
 def _guess_row_grain(headers: list[str], sample_rows: list[list[str]]) -> RowGrain:
@@ -85,7 +107,23 @@ def summarize_source_tables(evidence_store: list[EvidenceBlock]) -> list[SourceT
         sample_rows = rows[:5]
         grain = _guess_row_grain(headers, sample_rows)
         numeric_cols = _count_numeric_columns(headers, rows)
-        all_row_labels = [row[0].strip() for row in rows if row and row[0].strip()]
+        label_col = _row_label_column_index(headers)
+        all_row_labels = [
+            row[label_col].strip()
+            for row in rows
+            if len(row) > label_col and row[label_col].strip()
+        ]
+        # Deduplicate while preserving order (a base-model×method table repeats base models).
+        seen: set[str] = set()
+        unique_row_labels: list[str] = []
+        for lbl in all_row_labels:
+            if lbl.lower() not in seen:
+                seen.add(lbl.lower())
+                unique_row_labels.append(lbl)
+        all_row_labels = unique_row_labels
+        # Upgrade grain when the method column was chosen.
+        if label_col == 1 and grain == "base_model_plus_method":
+            grain = "method"
 
         table_idx += 1
         summaries.append(

@@ -7,6 +7,8 @@ import logging
 import re
 from typing import Literal
 
+from typing import TYPE_CHECKING
+
 from openai import AsyncOpenAI
 from pydantic import BaseModel
 
@@ -14,6 +16,9 @@ from app.config import Settings
 from app.models.data_table import EvidenceBlock
 from app.prompts.data_table import TABLE_PLANNER_SYSTEM
 from app.services.data_table.source_table_summary import SourceTableSummary
+
+if TYPE_CHECKING:
+    from app.services.data_table.result_summary_agent import ResultSummaryPlan
 
 logger = logging.getLogger(__name__)
 
@@ -225,6 +230,7 @@ async def plan_data_table(
     evidence_store: list[EvidenceBlock],
     source_table_summaries: list[SourceTableSummary],
     settings: Settings,
+    result_summary_plan: ResultSummaryPlan | None = None,
     debug_trace: list | None = None,
 ) -> DataTablePlan:
     client = AsyncOpenAI(
@@ -232,10 +238,30 @@ async def plan_data_table(
         base_url=settings.OPENAI_BASE_URL or None,
     )
 
+    # Build result_summary_plan guidance block if available.
+    plan_guidance = ""
+    if result_summary_plan is not None:
+        from app.services.data_table.result_summary_agent import RESULT_SUMMARY_COLUMNS  # noqa: PLC0415
+        rsp = result_summary_plan
+        column_line = ""
+        if rsp.columns != RESULT_SUMMARY_COLUMNS:
+            column_line = f"- suggested_columns: {rsp.columns}\n"
+        plan_guidance = (
+            "\n\nResultSummaryAgent guidance (use to anchor your decisions):\n"
+            f"- must_include rows (confirmed methods): {rsp.must_include}\n"
+            f"- exclude_as_rows (datasets/benchmarks, NOT row subjects): {rsp.exclude_as_rows}\n"
+            f"- baseline_labels: {rsp.baseline_labels}\n"
+            f"- table_classifications: {rsp.table_classifications}\n"
+            f"- row_groupings: {rsp.row_groupings}\n"
+            f"{column_line}"
+            "Use must_include to populate candidate_rows. Add exclude_as_rows to excluded_candidate_rows.\n"
+        )
+
     # keep the user message short: summaries only, no long evidence text
     user_msg = (
         f"User hint: {hint}\n\n"
-        f"Source table summaries:\n{_format_summaries(source_table_summaries)}\n\n"
+        f"Source table summaries:\n{_format_summaries(source_table_summaries)}"
+        f"{plan_guidance}\n\n"
         "Return compact JSON only. No markdown fences."
     )
 
@@ -264,6 +290,33 @@ async def plan_data_table(
                 "raw_output_preview": raw[:300] if raw else "(no output)",
             })
         return _FALLBACK_PLAN
+
+    # Apply ResultSummaryPlan overrides: enforce must_include, columns, exclude_as_rows.
+    if result_summary_plan is not None:
+        from app.services.data_table.result_summary_agent import RESULT_SUMMARY_COLUMNS as _RSC  # noqa: PLC0415
+        rsp = result_summary_plan
+        if rsp.must_include:
+            # Agent read the papers — its must_include is authoritative
+            plan.candidate_rows = list(rsp.must_include)
+
+        # If the agent suggested custom columns (e.g. architecture-focused), use them.
+        if rsp.columns and rsp.columns != _RSC:
+            plan.columns = [
+                PlannedColumn(name=col, description=col, value_type="string", evidence_policy="mixed")
+                for col in rsp.columns
+            ]
+
+        # Remove dataset/benchmark labels from candidate rows
+        excl_lower = {e.lower() for e in rsp.exclude_as_rows}
+        plan.candidate_rows = [r for r in plan.candidate_rows if r.lower() not in excl_lower]
+
+        # Add exclude_as_rows to excluded_candidate_rows
+        existing_excluded_lower = {e.row_label.lower() for e in plan.excluded_candidate_rows}
+        for label in rsp.exclude_as_rows:
+            if label.lower() not in existing_excluded_lower:
+                plan.excluded_candidate_rows.append(
+                    ExcludedCandidateRow(row_label=label, reason="dataset/benchmark — not a method/system row")
+                )
 
     # Fix 3: normalize evidence_ids — LLM may write "tbl_1" instead of the actual evidence_id.
     ev_id_set = {b.evidence_id for b in evidence_store}
