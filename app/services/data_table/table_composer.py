@@ -401,9 +401,13 @@ _LLM_MAX_CELLS = 60
 def _format_source_tables_for_summary(
     evidence_store: list[EvidenceBlock],
     allowed_ids: set[str],
-    max_tables: int = 4,
+    max_tables: int = 12,
 ) -> str:
-    """Format full source table markdown for the result summary LLM call."""
+    """Format full source table markdown for the result summary LLM call.
+
+    Tables are fed near-complete (the model needs every row to extract metrics);
+    with a 128k output budget and only a handful of papers there is ample room.
+    """
     lines = []
     count = 0
     for b in evidence_store:
@@ -415,24 +419,51 @@ def _format_source_tables_for_summary(
             break
         lines.append(
             f"[evidence_id={b.evidence_id}] {b.title or b.document_name or 'untitled'}\n"
-            f"{b.table_markdown[:1200]}"
+            f"{b.table_markdown[:6000]}"
         )
         count += 1
     return "\n\n---\n\n".join(lines) or "(no source tables)"
 
 
+# Sections worth feeding in full so qualitative cells can be richly synthesized.
+_RICH_SECTION_RE = re.compile(
+    r"architect|memory|retriev|method|approach|framework|mechanism|"
+    r"updat|evolv|storage|design|model|innovation|contribut|"
+    r"result|experiment|evaluat|benchmark|performance|abstract|introduction",
+    re.IGNORECASE,
+)
+
+
+def _is_rich_block(b: EvidenceBlock) -> bool:
+    title = b.title or ""
+    text_head = (b.text or "")[:160]
+    return bool(_RICH_SECTION_RE.search(title) or _RICH_SECTION_RE.search(text_head))
+
+
 def _format_text_for_summary(
     evidence_store: list[EvidenceBlock],
     allowed_ids: set[str],
-    max_items: int = 5,
+    max_items: int = 40,
+    char_limit: int = 1600,
 ) -> str:
+    """Feed rich method/architecture/results text so cells can be detailed.
+
+    Blocks whose title/head matches architecture/method/result sections are
+    prioritized and fed at a generous char limit; the model only writes dense
+    NotebookLM-style cells when it actually has the source material to do so.
+    """
+    candidates = [
+        b for b in evidence_store
+        if b.evidence_id in allowed_ids and not b.table_markdown and b.text
+    ]
+    # Rich (architecture/method/result) sections first, then the rest.
+    rich = [b for b in candidates if _is_rich_block(b)]
+    other = [b for b in candidates if not _is_rich_block(b)]
+    ordered = rich + other
+
     lines = []
-    for b in evidence_store:
-        if b.evidence_id not in allowed_ids or b.table_markdown:
-            continue
-        if len(lines) >= max_items:
-            break
-        preview = (b.text or "")[:400].replace("\n", " ")
+    for b in ordered[:max_items]:
+        preview = (b.text or "")[:char_limit].replace("\n", " ")
         lines.append(f"[{b.evidence_id}] {b.title or ''}: {preview}")
     return "\n".join(lines) or "(no text evidence)"
 

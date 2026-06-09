@@ -154,7 +154,7 @@ You receive:
 === YOUR JOB ===
 Produce ONE row per (method/system, and where they differ, per underlying-LLM / dataset) experiment record.
 - For QUANTITATIVE columns (F1, BLEU, Accuracy, Token Usage): copy exact numbers from the source tables. The quote MUST contain the number and come from the cited source table row.
-- For QUALITATIVE columns (architecture, retrieval method, key innovation): write a concise one-sentence synthesis from the paper's text. status="inferred" is fine.
+- For QUALITATIVE columns (architecture, retrieval method, key innovation, domain applicability): write a detailed, specific synthesis from the paper's text — 1 to 3 sentences naming the concrete components, mechanisms, and terminology the paper uses (e.g. name the storage tiers, the retrieval method, the update rule). Do NOT be vague or generic. status="inferred" is fine.
 - Include baseline methods that appear in comparison tables as their own rows (like NotebookLM does), not only the primary systems.
 - Use the dataset/benchmark and underlying LLM from the table title or row to disambiguate rows.
 
