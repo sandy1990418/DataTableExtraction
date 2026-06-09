@@ -273,7 +273,7 @@ async def plan_data_table(
                 {"role": "system", "content": TABLE_PLANNER_SYSTEM},
                 {"role": "user", "content": user_msg},
             ],
-            max_completion_tokens=2048,
+            max_completion_tokens=128000,
             temperature=0.0,
             response_format={"type": "json_object"},
         )

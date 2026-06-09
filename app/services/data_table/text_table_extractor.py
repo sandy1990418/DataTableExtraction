@@ -172,7 +172,7 @@ async def extract_tables_from_text_blocks(
                     {"role": "system", "content": _EXTRACTION_SYSTEM},
                     {"role": "user", "content": user_msg},
                 ],
-                max_completion_tokens=3000,
+                max_completion_tokens=128000,
                 temperature=0.0,
                 response_format={"type": "json_object"},
             )

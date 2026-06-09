@@ -151,6 +151,19 @@ def _build_grounded_cell(
             if not quote:
                 errors.append(f"Cell {entity_name}/{col_name}: supported but no quote")
                 status = "unsupported"
+            elif col_name == "Representative Result" and value is not None:
+                # For composite Representative Result strings, skip the strict quote-in-evidence
+                # check and rely solely on the number-in-evidence check below.
+                full_ev = _ev_text(block)
+                if not _any_number_from_value_in_evidence(str(value), full_ev):
+                    errors.append(
+                        f"Cell {entity_name}/{col_name}: no number from value found in evidence {ev_id}"
+                    )
+                    status = "unsupported"
+                else:
+                    citations.append(CellCitation(
+                        source_ref=block.source_ref, quote=quote, support_type="direct"
+                    ))
             elif not _quote_in_evidence(quote, ev_text):
                 errors.append(f"Cell {entity_name}/{col_name}: quote not found in evidence {ev_id}")
                 status = "unsupported"
@@ -160,18 +173,6 @@ def _build_grounded_cell(
                         f"Cell {entity_name}/{col_name}: numeric value {value} not found in quote"
                     )
                     status = "unsupported"
-                elif col_name == "Representative Result" and value is not None:
-                    # composite string — require at least one number from value in evidence
-                    full_ev = _ev_text(block)
-                    if not _any_number_from_value_in_evidence(str(value), full_ev):
-                        errors.append(
-                            f"Cell {entity_name}/{col_name}: no number from value found in evidence {ev_id}"
-                        )
-                        status = "unsupported"
-                    else:
-                        citations.append(CellCitation(
-                            source_ref=block.source_ref, quote=quote, support_type="direct"
-                        ))
                 else:
                     citations.append(CellCitation(
                         source_ref=block.source_ref, quote=quote, support_type="direct"

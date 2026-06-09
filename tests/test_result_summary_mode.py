@@ -145,8 +145,8 @@ def test_result_summary_has_no_metric_name_metric_value_columns():
 
 # ── LLM result summary composer ──────────────────────────────────────────────
 
-def _make_single_row_response(row_label: str, f1: str, bleu: str, ev_id: str = "ev_1") -> dict:
-    """Per-entity response format used by the new parallel composer (no discovered_columns)."""
+def _make_row_dict(row_label: str, f1: str, bleu: str, ev_id: str = "ev_1") -> dict:
+    """Single row dict used inside the single composer rows response."""
     return {
         "row_label": row_label,
         "cells": {
@@ -161,38 +161,40 @@ def _make_single_row_response(row_label: str, f1: str, bleu: str, ev_id: str = "
     }
 
 
+def _make_rows_response(rows_data: list[dict]) -> dict:
+    """Single composer response: all rows nested under one {"rows": [...]} object."""
+    return {"rows": rows_data}
+
+
 _DISCOVERED_COLS = ["Method / System", "F1 Score (%)", "BLEU-1 (%)", "Compared Against", "Key Takeaway"]
 
 
 @pytest.fixture
 def llm_result_summary_response():
     col_response = {"columns": _DISCOVERED_COLS}
-    row_responses = [
-        _make_single_row_response("A-MEM", "44.27", "20.09"),
-        _make_single_row_response("MemGPT", "1.18", "0.01"),
-    ]
-    return col_response, row_responses
+    rows_response = _make_rows_response(
+        [
+            _make_row_dict("A-MEM", "44.27", "20.09"),
+            _make_row_dict("MemGPT", "1.18", "0.01"),
+        ],
+    )
+    return col_response, rows_response
 
 
-def _make_mock_client(row_responses: list[dict], column_response: dict | None = None) -> AsyncMock:
-    """Create a mock OpenAI client whose create() returns column discovery then per-entity responses."""
+def _make_mock_client(column_response: dict, rows_response: dict) -> AsyncMock:
+    """Create a mock OpenAI client: call 1 returns column discovery, call 2 returns all rows."""
     mock_client = AsyncMock()
-    side_effects = []
-    if column_response is not None:
-        mock_resp = MagicMock()
-        mock_resp.choices[0].message.content = json.dumps(column_response)
-        side_effects.append(mock_resp)
-    for r in row_responses:
-        mock_resp = MagicMock()
-        mock_resp.choices[0].message.content = json.dumps(r)
-        side_effects.append(mock_resp)
-    mock_client.chat.completions.create = AsyncMock(side_effect=side_effects)
+    col_resp = MagicMock()
+    col_resp.choices[0].message.content = json.dumps(column_response)
+    rows_resp = MagicMock()
+    rows_resp.choices[0].message.content = json.dumps(rows_response)
+    mock_client.chat.completions.create = AsyncMock(side_effect=[col_resp, rows_resp])
     return mock_client
 
 
 @pytest.mark.asyncio
 async def test_compose_result_summary_calls_llm_not_long_form(llm_result_summary_response):
-    """compose_result_summary must call the LLM once for discovery + once per candidate row."""
+    """compose_result_summary makes exactly 2 LLM calls: column discovery + one single rows call."""
     block = _make_block()
     plan = _summary_plan()
 
@@ -202,14 +204,14 @@ async def test_compose_result_summary_calls_llm_not_long_form(llm_result_summary
     settings.OPENAI_BASE_URL = None
     settings.OPENAI_MODEL = "gpt-4o-mini"
 
-    col_response, row_responses = llm_result_summary_response
+    col_response, rows_response = llm_result_summary_response
     with patch("app.services.data_table.table_composer.AsyncOpenAI") as mock_openai:
-        mock_client = _make_mock_client(row_responses, column_response=col_response)
+        mock_client = _make_mock_client(col_response, rows_response)
         mock_openai.return_value = mock_client
 
         draft = await compose_result_summary("Compare memory results", plan, [block], [], settings)
 
-    assert mock_client.chat.completions.create.call_count == 3  # 1 discovery + 2 entity calls
+    assert mock_client.chat.completions.create.call_count == 2  # 1 discovery + 1 single rows call
     assert len(draft.rows) == 2
     assert "Method / System" in draft.headers
 
@@ -226,9 +228,9 @@ async def test_compose_result_summary_row_grain_is_method_level(llm_result_summa
     settings.OPENAI_BASE_URL = None
     settings.OPENAI_MODEL = "gpt-4o-mini"
 
-    col_response, row_responses = llm_result_summary_response
+    col_response, rows_response = llm_result_summary_response
     with patch("app.services.data_table.table_composer.AsyncOpenAI") as mock_openai:
-        mock_client = _make_mock_client(row_responses, column_response=col_response)
+        mock_client = _make_mock_client(col_response, rows_response)
         mock_openai.return_value = mock_client
 
         draft = await compose_result_summary("Compare memory results", plan, [block], [], settings)
@@ -251,9 +253,9 @@ async def test_compose_result_summary_f1_cell_has_number(llm_result_summary_resp
     settings.OPENAI_BASE_URL = None
     settings.OPENAI_MODEL = "gpt-4o-mini"
 
-    col_response, row_responses = llm_result_summary_response
+    col_response, rows_response = llm_result_summary_response
     with patch("app.services.data_table.table_composer.AsyncOpenAI") as mock_openai:
-        mock_client = _make_mock_client(row_responses, column_response=col_response)
+        mock_client = _make_mock_client(col_response, rows_response)
         mock_openai.return_value = mock_client
 
         draft = await compose_result_summary("Compare memory results", plan, [block], [], settings)
@@ -276,9 +278,9 @@ async def test_compose_result_summary_headers_discovered_from_data(llm_result_su
     settings.OPENAI_BASE_URL = None
     settings.OPENAI_MODEL = "gpt-4o-mini"
 
-    col_response, row_responses = llm_result_summary_response
+    col_response, rows_response = llm_result_summary_response
     with patch("app.services.data_table.table_composer.AsyncOpenAI") as mock_openai:
-        mock_client = _make_mock_client(row_responses, column_response=col_response)
+        mock_client = _make_mock_client(col_response, rows_response)
         mock_openai.return_value = mock_client
 
         draft = await compose_result_summary("Compare memory results", plan, [block], [], settings)

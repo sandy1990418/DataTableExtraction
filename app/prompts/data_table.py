@@ -124,44 +124,52 @@ You will receive summaries of all papers' tables (headers, sample rows) and text
 
 Your job: design 5-8 columns that:
 1. Start with "Method / System" (always first)
-2. Are meaningful for the user's hint
-3. Can be filled (even partially) by most papers
-4. Use normalized names across papers:
+2. Always include "Underlying LLM" as the second column (position 2)
+3. Always include "Dataset Evaluated" as the third column (position 3)
+   - These two are mandatory because per-source extraction produces rows where LLM and dataset vary across papers
+4. Are meaningful for the user's hint
+5. Can be filled (even partially) by most papers
+6. Use normalized names across papers:
    - F1 scores → "F1 Score (%)"
    - BLEU scores → "BLEU-1 (%)"
    - Retrieval/memory accuracy → "Accuracy (%)"
    - Token count/usage → "Token Usage (avg)"
-   - Dataset/benchmark name → "Dataset"
+   - Dataset/benchmark name → "Dataset Evaluated"
    - LLM model used → "Underlying LLM"
-5. Include "Compared Against" and "Key Takeaway" as last columns
+7. Include "Compared Against" and "Key Takeaway" as last columns
 
-Return: {"columns": ["Method / System", ...]}
+Return: {"columns": ["Method / System", "Underlying LLM", "Dataset Evaluated", ...]}
 No markdown fences.
 """
 
-TABLE_RESULT_SUMMARY_SYSTEM = """\
-You are extracting results from ONE academic paper into a single table row.
+TABLE_SINGLE_CALL_SYSTEM = """\
+You are generating a grounded comparison data table from multiple academic papers in ONE pass.
 
-You will receive ALL text and tables from that system's own paper.
-You will also receive a fixed list of columns to fill ("Columns to fill" in the user message).
+You receive:
+- A fixed list of columns to fill ("Columns to fill")
+- ALL source tables from the papers (full markdown, each labelled [evidence_id=...])
+- Key text passages from the papers (each labelled [evidence_id])
+- Guidance on which methods/systems should be rows
 
 === YOUR JOB ===
-Fill every column using only this paper's evidence. Do NOT invent values.
+Produce ONE row per (method/system, and where they differ, per underlying-LLM / dataset) experiment record.
+- For QUANTITATIVE columns (F1, BLEU, Accuracy, Token Usage): copy exact numbers from the source tables. The quote MUST contain the number and come from the cited source table row.
+- For QUALITATIVE columns (architecture, retrieval method, key innovation): write a concise one-sentence synthesis from the paper's text. status="inferred" is fine.
+- Include baseline methods that appear in comparison tables as their own rows (like NotebookLM does), not only the primary systems.
+- Use the dataset/benchmark and underlying LLM from the table title or row to disambiguate rows.
 
-=== COLUMN DISCOVERY RULES ===
-Use exactly the columns listed in "Columns to fill" in the user message. Do not invent new columns.
+=== ROW LIMIT ===
+Produce at most 15 rows. Prioritize the most informative experiment records.
 
 === RETURN FORMAT ===
-{"row_label": "<system name>", "cells": {"<col>": {"value": <string or null>, "status": <"supported"|"inferred"|"not_reported">, "evidence_id": <id or null>, "quote": <string ≤80 chars or null>}}}
+{"rows": [{"row_label": "<method> (<LLM/dataset if disambiguating>)", "cells": {"<col>": {"value": <string or null>, "status": <"supported"|"inferred"|"not_reported">, "evidence_id": <id or null>, "quote": <string ≤80 chars or null>}}}]}
 
-=== CELL FILLING RULES ===
-- Metric columns (F1 Score, BLEU-1, Accuracy, Token Usage...): extract exact numbers from source tables. Quote must contain the number.
-- "Dataset": name of the benchmark/dataset used in the paper's main experiment.
-- "Underlying LLM": which LLM model(s) the paper uses (e.g. GPT-4o-mini, LLaMA).
-- "Compared Against": list baseline names from the paper's own comparison tables.
-- "Key Takeaway": one sentence summary of main contribution, status=inferred is fine.
-- Missing value: value=null, status="not_reported", evidence_id=null, quote=null.
+=== RULES ===
 - Only cite evidence_ids that appear in the provided evidence.
+- Numeric cell quote must contain the number.
+- Do NOT put a dataset name (LoCoMo, DialSim) as a Method/System row value.
+- Do NOT put a method name in the "Underlying LLM" column.
+- Missing value: value=null, status="not_reported", evidence_id=null, quote=null.
 - Return compact JSON. No markdown fences.
 """
 

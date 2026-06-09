@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import re
@@ -13,7 +12,7 @@ from pydantic import BaseModel
 
 from app.config import Settings
 from app.models.data_table import EvidenceBlock
-from app.prompts.data_table import DISCOVER_COLUMNS_SYSTEM, TABLE_COMPOSER_SYSTEM, TABLE_RESULT_SUMMARY_SYSTEM
+from app.prompts.data_table import DISCOVER_COLUMNS_SYSTEM, TABLE_COMPOSER_SYSTEM, TABLE_SINGLE_CALL_SYSTEM
 from app.services.data_table.source_table_rows import (
     extract_source_table_candidates,
     parse_markdown_table,
@@ -438,81 +437,6 @@ def _format_text_for_summary(
     return "\n".join(lines) or "(no text evidence)"
 
 
-def _normalize_name(name: str) -> str:
-    """Normalize entity/document name for fuzzy matching."""
-    return re.sub(r"[\s\-_\.]+", "", name.lower())
-
-
-def _match_entity_to_document(entity: str, doc_names: list[str]) -> str | None:
-    """Find which document name best matches an entity name."""
-    ent_norm = _normalize_name(entity)
-    # Strip file extension from document names for matching
-    for doc in doc_names:
-        doc_stem = re.sub(r"\.(md|pdf|txt)$", "", doc, flags=re.IGNORECASE)
-        if _normalize_name(doc_stem) == ent_norm:
-            return doc
-    # Substring match: entity contained in doc stem or vice versa
-    for doc in doc_names:
-        doc_stem = re.sub(r"\.(md|pdf|txt)$", "", doc, flags=re.IGNORECASE)
-        doc_norm = _normalize_name(doc_stem)
-        if ent_norm in doc_norm or doc_norm in ent_norm:
-            return doc
-    return None
-
-
-_RESULTS_SECTION_RE = re.compile(
-    r"result|experiment|evaluat|benchmark|performance|ablat|comparison|metric|table",
-    re.IGNORECASE,
-)
-
-
-def _is_results_block(b: EvidenceBlock) -> bool:
-    title = b.title or ""
-    text_head = (b.text or "")[:120]
-    return bool(_RESULTS_SECTION_RE.search(title) or _RESULTS_SECTION_RE.search(text_head))
-
-
-def _build_entity_evidence(
-    entity: str,
-    doc_blocks: dict[str, list[EvidenceBlock]],
-    all_doc_names: list[str],
-) -> str:
-    """Return the full evidence string for a single entity.
-
-    All blocks from the matched document are included — no char limit.
-    Results/experiment blocks are sorted to the top so the LLM sees them first.
-    """
-    matched_doc = _match_entity_to_document(entity, all_doc_names)
-    if matched_doc is None:
-        return f"--- {entity} (no matched document) ---\n(No direct paper evidence found.)"
-
-    blocks = doc_blocks[matched_doc]
-
-    # Sort: tables first, then results-section text, then other text
-    table_blocks = [b for b in blocks if b.table_markdown]
-    result_text_blocks = [b for b in blocks if not b.table_markdown and _is_results_block(b)]
-    other_text_blocks = [b for b in blocks if not b.table_markdown and not _is_results_block(b)]
-    ordered = table_blocks + result_text_blocks + other_text_blocks
-
-    section_lines = [f"--- {entity} (document: {matched_doc}) ---"]
-
-    table_added = False
-    text_header_added = False
-    for b in ordered:
-        if b.table_markdown and not table_added:
-            section_lines.append("Source table (from this system's own paper):")
-            section_lines.append(f"  [{b.evidence_id}] {b.title or 'Table'}\n{b.table_markdown}")
-            table_added = True
-        elif b.text:
-            if not text_header_added:
-                section_lines.append("Paper text (abstract / method / results):")
-                text_header_added = True
-            text = (b.text or "").strip()
-            section_lines.append(f"  [{b.evidence_id}] {b.title or ''}: {text}")
-
-    return "\n".join(section_lines)
-
-
 async def _discover_unified_columns(
     hint: str,
     evidence_store: list[EvidenceBlock],
@@ -573,103 +497,18 @@ async def _discover_unified_columns(
     return RESULT_SUMMARY_HEADERS
 
 
-async def _compose_single_entity_row(
-    entity: str,
-    hint: str,
-    entity_evidence: str,
-    rsp_guidance: str,
-    repair_errors: list[str] | None,
-    client: AsyncOpenAI,
-    model: str,
-    fixed_columns: list[str] | None = None,
-) -> dict | None:
-    """Call the LLM once for a single entity. Returns raw dict with discovered_columns + cells."""
-    repair_section = ""
-    if repair_errors:
-        repair_section = (
-            "\n\nPREVIOUS ATTEMPT HAD ERRORS — repair these issues:\n"
-            + "\n".join(f"- {e}" for e in repair_errors)
-            + "\n"
-        )
-
-    if fixed_columns:
-        # Architecture mode: columns are pre-specified, no discovery needed
-        col_instruction = (
-            f"Use exactly these columns (pre-specified): {fixed_columns}\n"
-            "Return discovered_columns = the same list.\n"
-        )
-    else:
-        col_instruction = (
-            "Discover columns from this paper's own tables and text.\n"
-            "Always start with 'Method / System'.\n"
-        )
-
-    user_msg = (
-        f"User hint: {hint}\n\n"
-        f"System to extract: {entity}\n"
-        f"{col_instruction}\n"
-        f"=== Evidence from {entity}'s own paper ===\n"
-        f"{entity_evidence}"
-        f"{rsp_guidance}"
-        f"{repair_section}\n\n"
-        "Return compact JSON only. No markdown fences."
-    )
-
-    try:
-        response = await client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": TABLE_RESULT_SUMMARY_SYSTEM},
-                {"role": "user", "content": user_msg},
-            ],
-            max_completion_tokens=1024,
-            temperature=0.0,
-            response_format={"type": "json_object"},
-        )
-        raw = response.choices[0].message.content or "{}"
-        data = json.loads(raw)
-        # Normalise: accept {"row": {...}} or flat format
-        if "row" in data and isinstance(data["row"], dict):
-            data = data["row"]
-        data.setdefault("row_label", entity)
-        return data
-    except Exception as exc:
-        logger.warning("compose single entity row failed for %s: %s", entity, exc)
-        return None
-
-
-def _align_rows(
-    raw_results: list[dict],
-    fallback_columns: list[str],
-) -> tuple[list[str], list[DraftRow]]:
-    """Merge per-entity discovered columns into a unified column list, then build DraftRows."""
-    from collections import Counter
-
-    col_counter: Counter = Counter()
-    for r in raw_results:
-        for col in r.get("discovered_columns", []):
-            if col:
-                col_counter[col] += 1
-
-    if col_counter:
-        # "Method / System" always first; then most-common columns
-        entity_col = "Method / System"
-        ordered = [entity_col] + [
-            col for col, _ in col_counter.most_common()
-            if col != entity_col
-        ]
-        final_headers = ordered
-    else:
-        final_headers = fallback_columns
-
+def _rows_from_fixed_columns(raw_rows: list, fixed_columns: list[str]) -> list[DraftRow]:
+    """Align raw LLM rows to a fixed column list (single-call composer output)."""
     rows: list[DraftRow] = []
-    for r in raw_results:
-        label = str(r.get("row_label", "")).strip()
+    for raw_row in raw_rows:
+        if not isinstance(raw_row, dict):
+            continue
+        label = str(raw_row.get("row_label", "")).strip()
         if not label:
             continue
-        raw_cells = r.get("cells", {})
+        raw_cells = raw_row.get("cells", {}) or {}
         cells: dict[str, DraftCell] = {}
-        for col in final_headers:
+        for col in fixed_columns:
             raw_cell = raw_cells.get(col, {})
             if isinstance(raw_cell, dict):
                 status = raw_cell.get("status", "not_reported")
@@ -684,8 +523,7 @@ def _align_rows(
             else:
                 cells[col] = DraftCell(value=None, status="not_reported")
         rows.append(DraftRow(row_label=label, cells=cells))
-
-    return final_headers, rows
+    return rows
 
 
 async def compose_result_summary(
@@ -697,11 +535,11 @@ async def compose_result_summary(
     result_summary_plan: ResultSummaryPlan | None = None,
     repair_errors: list[str] | None = None,
 ) -> DraftDataTable:
-    """LLM composer for result_summary mode.
+    """NotebookLM-style single long-context composer for result_summary mode.
 
-    One LLM call per entity in parallel. Each call reads its own paper in full
-    and discovers columns from the actual data — no fixed schema imposed.
-    After all calls complete, columns are merged into a unified header list.
+    Phase 1: discover (or take from plan) a unified column schema.
+    Phase 2: ONE LLM call over ALL source tables + text evidence that emits the
+    full table at once. No per-source decomposition, no dedup/merge step.
     """
     client = AsyncOpenAI(
         api_key=settings.OPENAI_API_KEY,
@@ -709,14 +547,12 @@ async def compose_result_summary(
     )
 
     allowed_ids = _allowed_evidence_ids(plan, evidence_store)
-    candidate_rows = plan.candidate_rows or []
 
-    # Use fixed columns only for architecture mode (detected by arch-specific column names).
-    # For benchmark/result hints, discover unified schema from all papers (Phase 1).
+    # Phase 1 — column schema (anchors the single call)
     _ARCH_COL_MARKERS = {"Memory Architecture", "Memory Update / Retrieval", "Key Innovation"}
     plan_cols = [c.name for c in plan.columns] if plan.columns else []
     if _ARCH_COL_MARKERS & set(plan_cols):
-        # Architecture mode: use plan columns
+        # Architecture mode: use plan columns directly (no discovery call)
         fixed_columns = plan_cols
     else:
         # Benchmark/result mode: discover unified schema from all papers
@@ -724,41 +560,63 @@ async def compose_result_summary(
             hint, evidence_store, source_table_summaries, client, settings.OPENAI_MODEL
         )
 
-    doc_blocks: dict[str, list[EvidenceBlock]] = {}
-    for b in evidence_store:
-        if b.evidence_id not in allowed_ids:
-            continue
-        name = b.document_name or b.source_id or "(unknown)"
-        doc_blocks.setdefault(name, []).append(b)
-    all_doc_names = list(doc_blocks.keys())
+    # Build the single-call user message
+    source_tables_str = _format_source_tables_for_summary(evidence_store, allowed_ids, max_tables=8)
+    text_str = _format_text_for_summary(evidence_store, allowed_ids, max_items=8)
 
     rsp_guidance = ""
     if result_summary_plan is not None:
         rsp = result_summary_plan
-        groupings = "; ".join(" = ".join(g) for g in rsp.row_groupings) if rsp.row_groupings else "(none)"
+        must = ", ".join(rsp.must_include) if rsp.must_include else "(none)"
+        excl = ", ".join(rsp.exclude_as_rows) if rsp.exclude_as_rows else "(none)"
+        row_groupings = getattr(rsp, "row_groupings", None)
+        groupings = (
+            "; ".join("/".join(g) for g in row_groupings) if row_groupings else "(none)"
+        )
         rsp_guidance = (
-            f"\n\nResultSummaryAgent guidance:\n"
-            f"- row_groupings (merge these name variants): {groupings}\n"
+            "\n\nPlanning guidance:\n"
+            f"- must_include (MUST be rows): {must}\n"
+            f"- exclude_as_rows (NEVER rows): {excl}\n"
+            f"- row_groupings (merge variants): {groupings}\n"
+            f"- row_grain: {rsp.row_grain}\n"
         )
 
-    tasks = [
-        _compose_single_entity_row(
-            entity=entity,
-            hint=hint,
-            entity_evidence=_build_entity_evidence(entity, doc_blocks, all_doc_names),
-            rsp_guidance=rsp_guidance,
-            repair_errors=repair_errors,
-            client=client,
+    repair_section = ""
+    if repair_errors:
+        repair_section = (
+            "\n\nPREVIOUS ATTEMPT HAD ERRORS — repair these issues:\n"
+            + "\n".join(f"- {e}" for e in repair_errors)
+            + "\n"
+        )
+
+    user_msg = (
+        f"User hint: {hint}\n\n"
+        f"Columns to fill (use exactly, in order): {fixed_columns}\n\n"
+        f"=== Source result tables ===\n{source_tables_str}\n\n"
+        f"=== Key text evidence ===\n{text_str}"
+        f"{rsp_guidance}"
+        f"{repair_section}\n\n"
+        f"Produce at most {_LLM_MAX_ROWS} rows. Return compact JSON only."
+    )
+
+    try:
+        response = await client.chat.completions.create(
             model=settings.OPENAI_MODEL,
-            fixed_columns=fixed_columns,
+            messages=[
+                {"role": "system", "content": TABLE_SINGLE_CALL_SYSTEM},
+                {"role": "user", "content": user_msg},
+            ],
+            max_completion_tokens=128000,
+            temperature=0.0,
+            response_format={"type": "json_object"},
         )
-        for entity in candidate_rows
-    ]
-    raw_results = await asyncio.gather(*tasks)
-    raw_results = [r for r in raw_results if r is not None]
+        raw = response.choices[0].message.content or "{}"
+        data = json.loads(raw)
+    except Exception as exc:
+        logger.warning("compose_result_summary single call failed: %s", exc)
+        return DraftDataTable(headers=fixed_columns, rows=[], notes=[str(exc)])
 
-    _, rows = _align_rows(raw_results, fallback_columns=fixed_columns)
-
+    rows = _rows_from_fixed_columns(data.get("rows", []), fixed_columns)
     if len(rows) > _LLM_MAX_ROWS:
         rows = rows[:_LLM_MAX_ROWS]
 
@@ -823,7 +681,7 @@ async def compose_data_table(
                 {"role": "system", "content": TABLE_COMPOSER_SYSTEM},
                 {"role": "user", "content": user_msg},
             ],
-            max_completion_tokens=4096,
+            max_completion_tokens=128000,
             temperature=0.0,
             response_format={"type": "json_object"},
         )
