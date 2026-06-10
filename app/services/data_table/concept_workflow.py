@@ -23,6 +23,7 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel
 
 from app.config import Settings
+from app.services.data_table.llm_client import make_client
 from app.models.data_table import EvidenceBlock
 from app.prompts.data_table import (
     CONCEPT_CRITIC_SYSTEM,
@@ -256,10 +257,7 @@ async def run_concept_workflow(
 ) -> DraftDataTable:
     """Run the four-stage concept workflow; fall back to the single-call composer
     if the outline stage fails."""
-    client = AsyncOpenAI(
-        api_key=settings.OPENAI_API_KEY,
-        base_url=settings.OPENAI_BASE_URL or None,
-    )
+    client = make_client(settings)
     model = settings.OPENAI_MODEL
     allowed_ids = _allowed_evidence_ids(plan, evidence_store)
     columns = [c.name for c in plan.columns] if plan.columns else []

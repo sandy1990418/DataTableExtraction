@@ -11,6 +11,7 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel
 
 from app.config import Settings
+from app.services.data_table.llm_client import make_client
 from app.models.data_table import EvidenceBlock
 from app.prompts.data_table import (
     CONCEPT_SUMMARY_SYSTEM,
@@ -577,10 +578,7 @@ async def compose_result_summary(
     Phase 2: ONE LLM call over ALL source tables + text evidence that emits the
     full table at once. No per-source decomposition, no dedup/merge step.
     """
-    client = AsyncOpenAI(
-        api_key=settings.OPENAI_API_KEY,
-        base_url=settings.OPENAI_BASE_URL or None,
-    )
+    client = make_client(settings)
 
     allowed_ids = _allowed_evidence_ids(plan, evidence_store)
 
@@ -700,10 +698,7 @@ async def compose_concept_summary(
     ONE long-context LLM call over all text evidence; one rich row per concept
     from plan.candidate_rows, columns taken directly from the plan.
     """
-    client = AsyncOpenAI(
-        api_key=settings.OPENAI_API_KEY,
-        base_url=settings.OPENAI_BASE_URL or None,
-    )
+    client = make_client(settings)
 
     allowed_ids = _allowed_evidence_ids(plan, evidence_store)
     fixed_columns = [c.name for c in plan.columns] if plan.columns else []
@@ -763,10 +758,7 @@ async def compose_data_table(
     result_summary_plan: ResultSummaryPlan | None = None,
     repair_errors: list[str] | None = None,
 ) -> DraftDataTable:
-    client = AsyncOpenAI(
-        api_key=settings.OPENAI_API_KEY,
-        base_url=settings.OPENAI_BASE_URL or None,
-    )
+    client = make_client(settings)
 
     allowed_ids = _allowed_evidence_ids(plan, evidence_store)
 

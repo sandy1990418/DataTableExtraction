@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-import json
-from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
 
 from app.models.data_table import EvidenceBlock, SourceRef
 from app.services.data_table.source_table_summary import summarize_source_tables
-from app.services.data_table.table_composer import RESULT_SUMMARY_HEADERS, DraftDataTable, DraftRow, DraftCell
+from app.services.data_table.table_composer import DraftDataTable, DraftRow, DraftCell
 from app.services.data_table.table_planner import (
     RESULT_SUMMARY_HEADERS,
     DataTablePlan,
@@ -215,7 +212,7 @@ def test_source_table_summaries_have_correct_evidence_ids():
 def test_evidence_id_normalization_tbl_id_resolved():
     """plan_data_table post-processes evidence decisions: tbl_1 → real evidence_id."""
     # test _parse_plan + normalization logic independently
-    from app.services.data_table.table_planner import EvidenceDecision, ExcludedSourceTable
+    from app.services.data_table.table_planner import EvidenceDecision
 
     # simulate what plan_data_table does after _parse_plan
     ev_id_set = {"txt_amem_0"}

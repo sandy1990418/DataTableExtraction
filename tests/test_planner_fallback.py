@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
 
 from app.models.data_table import EvidenceBlock, SourceRef
 from app.services.data_table.table_composer import (
@@ -14,7 +13,6 @@ from app.services.data_table.table_composer import (
 from app.services.data_table.table_planner import (
     DataTablePlan,
     PlannedColumn,
-    _FALLBACK_PLAN,
     _extract_json,
 )
 

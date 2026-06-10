@@ -18,6 +18,8 @@ class Settings:
         self.OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", os.getenv("AI_MODEL", "gpt-4o-mini"))
         self.MAX_TOKENS: int = int(os.getenv("MAX_TOKENS", "-1"))
         self.TEMPERATURE: float = float(os.getenv("TEMPERATURE", "0.3"))
+        self.LLM_TIMEOUT_SECONDS: float = float(os.getenv("LLM_TIMEOUT_SECONDS", "120"))
+        self.LLM_MAX_RETRIES: int = int(os.getenv("LLM_MAX_RETRIES", "1"))
         self.DOWNLOAD_TTL_SECONDS: int = int(os.getenv("DOWNLOAD_TTL_SECONDS", "600"))
         self.SESSION_TTL_SECONDS: int = int(os.getenv("SESSION_TTL_SECONDS", "1800"))
         for key, value in overrides.items():

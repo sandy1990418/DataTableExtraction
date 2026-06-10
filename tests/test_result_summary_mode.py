@@ -10,10 +10,6 @@ import pytest
 from app.models.data_table import EvidenceBlock, SourceRef
 from app.services.data_table.table_composer import (
     RESULT_SUMMARY_HEADERS,
-    DraftDataTable,
-    DraftRow,
-    DraftCell,
-    _parse_draft,
     _format_source_tables_for_summary,
     compose_result_summary,
 )
@@ -205,7 +201,7 @@ async def test_compose_result_summary_calls_llm_not_long_form(llm_result_summary
     settings.OPENAI_MODEL = "gpt-4o-mini"
 
     col_response, rows_response = llm_result_summary_response
-    with patch("app.services.data_table.table_composer.AsyncOpenAI") as mock_openai:
+    with patch("app.services.data_table.table_composer.make_client") as mock_openai:
         mock_client = _make_mock_client(col_response, rows_response)
         mock_openai.return_value = mock_client
 
@@ -229,7 +225,7 @@ async def test_compose_result_summary_row_grain_is_method_level(llm_result_summa
     settings.OPENAI_MODEL = "gpt-4o-mini"
 
     col_response, rows_response = llm_result_summary_response
-    with patch("app.services.data_table.table_composer.AsyncOpenAI") as mock_openai:
+    with patch("app.services.data_table.table_composer.make_client") as mock_openai:
         mock_client = _make_mock_client(col_response, rows_response)
         mock_openai.return_value = mock_client
 
@@ -254,7 +250,7 @@ async def test_compose_result_summary_f1_cell_has_number(llm_result_summary_resp
     settings.OPENAI_MODEL = "gpt-4o-mini"
 
     col_response, rows_response = llm_result_summary_response
-    with patch("app.services.data_table.table_composer.AsyncOpenAI") as mock_openai:
+    with patch("app.services.data_table.table_composer.make_client") as mock_openai:
         mock_client = _make_mock_client(col_response, rows_response)
         mock_openai.return_value = mock_client
 
@@ -279,7 +275,7 @@ async def test_compose_result_summary_headers_discovered_from_data(llm_result_su
     settings.OPENAI_MODEL = "gpt-4o-mini"
 
     col_response, rows_response = llm_result_summary_response
-    with patch("app.services.data_table.table_composer.AsyncOpenAI") as mock_openai:
+    with patch("app.services.data_table.table_composer.make_client") as mock_openai:
         mock_client = _make_mock_client(col_response, rows_response)
         mock_openai.return_value = mock_client
 

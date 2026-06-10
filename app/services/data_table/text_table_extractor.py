@@ -8,13 +8,14 @@ the LLM for table reconstruction.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections import defaultdict
 
-from openai import AsyncOpenAI
 
 from app.config import Settings
+from app.services.data_table.llm_client import make_client
 from app.models.data_table import EvidenceBlock, SourceRef
 from app.services.data_table.source_table_rows import _normalize, _score_table
 
@@ -45,6 +46,8 @@ Rules:
 _MAX_CHARS_PER_DOC = 12000
 # minimum score to keep an extracted table
 _MIN_SCORE = 4.0
+# minimum numeric lines in the selected sections to bother calling the LLM
+_MIN_NUMBER_LINES = 5
 
 
 def _markdown_from_headers_rows(headers: list[str], rows: list[list[str]]) -> str:
@@ -143,20 +146,17 @@ async def extract_tables_from_text_blocks(
     if not doc_groups:
         return []
 
-    client = AsyncOpenAI(
-        api_key=settings.OPENAI_API_KEY,
-        base_url=settings.OPENAI_BASE_URL or None,
-    )
+    client = make_client(settings)
 
-    extracted: list[EvidenceBlock] = []
-
-    for doc_name, blocks in doc_groups.items():
+    async def _extract_one(doc_name: str, blocks: list[EvidenceBlock]) -> tuple[str, list[EvidenceBlock], dict]:
         combined_text = _select_rich_sections(blocks, _MAX_CHARS_PER_DOC)
         if not combined_text.strip():
-            continue
-
-        # representative source ref from first block
-        first_block = blocks[0]
+            return doc_name, blocks, {}
+        # documents with almost no numeric lines cannot contain benchmark tables —
+        # skip the LLM call entirely (e.g. lecture transcripts)
+        if _count_number_lines(combined_text) < _MIN_NUMBER_LINES:
+            logger.info("text_table_extractor: skipping %s (no numeric content)", doc_name)
+            return doc_name, blocks, {}
 
         user_msg = (
             f"Hint: {hint}\n\n"
@@ -164,7 +164,6 @@ async def extract_tables_from_text_blocks(
             f"{combined_text}\n\n"
             "Extract any benchmark/result tables from the above text. Return JSON only."
         )
-
         try:
             response = await client.chat.completions.create(
                 model=settings.OPENAI_MODEL,
@@ -172,15 +171,26 @@ async def extract_tables_from_text_blocks(
                     {"role": "system", "content": _EXTRACTION_SYSTEM},
                     {"role": "user", "content": user_msg},
                 ],
-                max_completion_tokens=128000,
+                max_completion_tokens=16000,
                 temperature=0.0,
                 response_format={"type": "json_object"},
             )
             raw = response.choices[0].message.content or "{}"
-            data = json.loads(raw)
+            return doc_name, blocks, json.loads(raw)
         except Exception as exc:
             logger.warning("text_table_extractor LLM failed for %s: %s", doc_name, exc)
+            return doc_name, blocks, {}
+
+    results = await asyncio.gather(*(
+        _extract_one(doc_name, blocks) for doc_name, blocks in doc_groups.items()
+    ))
+
+    extracted: list[EvidenceBlock] = []
+
+    for doc_name, blocks, data in results:
+        if not data:
             continue
+        first_block = blocks[0]
 
         for i, tbl in enumerate(data.get("tables", [])):
             headers = [str(h).strip() for h in tbl.get("headers", []) if str(h).strip()]

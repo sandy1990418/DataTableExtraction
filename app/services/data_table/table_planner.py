@@ -9,10 +9,10 @@ from typing import Literal
 
 from typing import TYPE_CHECKING
 
-from openai import AsyncOpenAI
 from pydantic import BaseModel
 
 from app.config import Settings
+from app.services.data_table.llm_client import make_client
 from app.models.data_table import EvidenceBlock
 from app.prompts.data_table import TABLE_PLANNER_SYSTEM
 from app.services.data_table.source_table_summary import SourceTableSummary
@@ -268,10 +268,7 @@ async def plan_data_table(
     result_summary_plan: ResultSummaryPlan | None = None,
     debug_trace: list | None = None,
 ) -> DataTablePlan:
-    client = AsyncOpenAI(
-        api_key=settings.OPENAI_API_KEY,
-        base_url=settings.OPENAI_BASE_URL or None,
-    )
+    client = make_client(settings)
 
     # Build result_summary_plan guidance block if available.
     plan_guidance = ""

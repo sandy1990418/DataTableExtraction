@@ -2,18 +2,15 @@
 
 from __future__ import annotations
 
-import pytest
 
 from app.models.data_table import (
     DataTableColumn,
-    DataTableSchema,
     EvidenceBlock,
     RowEntity,
     SourceRef,
 )
 from app.services.data_table.strategy import select_strategy
 from app.services.data_table.source_table_rows import (
-    SourceTableCandidate,
     extract_source_table_candidates,
     parse_markdown_table,
 )
