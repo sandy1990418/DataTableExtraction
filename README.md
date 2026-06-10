@@ -191,6 +191,24 @@ populates grounded rows, composes a PPT plan, and renders the deck.
 }
 ```
 
+### `POST /data-table` — grounded table + PPTX export
+
+Builds one NotebookLM-style grounded data table and returns the table data, citations,
+debug details, and a downloadable PPTX containing the generated table.
+
+```jsonc
+// response excerpt
+{
+  "type": "data_table",
+  "table": {"headers": ["Model", "Score"], "rows": [["Model A", "92.5"]]},
+  "pptx": {
+    "type": "download",
+    "url": "/download/<token>",
+    "filename": "Exported Results.pptx"
+  }
+}
+```
+
 The important quality gate is `spec_reviews`: table specs are checked before row
 population. This is where vague or unsupported columns should be caught before the
 system spends tokens filling a bad table.

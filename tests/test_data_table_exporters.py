@@ -16,6 +16,7 @@ from app.services.data_table.exporters import (
     compute_table_metrics,
     to_citation_table,
     to_debug_json,
+    to_pptx_table,
     to_simple_table,
 )
 
@@ -61,6 +62,19 @@ def test_main_table_export():
     assert len(simple["rows"]) == 2
     assert simple["rows"][0][0] == "ModelA"
     assert simple["rows"][1][1] == ""  # not_reported → empty
+
+
+def test_pptx_table_export():
+    pptx_table = to_pptx_table(_make_table())
+
+    assert pptx_table == {
+        "table_id": "data_table",
+        "title": "Speech Models",
+        "kind": "extracted_summary",
+        "headers": ["Model", "Streaming", "BLEU"],
+        "rows": [["ModelA", "Yes", "45.6"], ["ModelB", "", ""]],
+        "layout": "table_only",
+    }
 
 
 def test_citation_table_export():

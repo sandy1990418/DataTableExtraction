@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
 from app.config import Settings, get_settings
 from app.models.schemas import DocumentInput
-from app.services.data_table.exporters import to_citation_table, to_debug_json, to_simple_table
+from app.services.data_table.exporters import (
+    to_citation_table,
+    to_debug_json,
+    to_pptx_table,
+    to_simple_table,
+)
 from app.services.data_table.pipeline import generate_data_table
-from app.services.pipeline import build_evidence, resolve_documents
+from app.services.pipeline import build_evidence, render_pptx, resolve_documents
 
 router = APIRouter()
 
@@ -38,6 +45,13 @@ async def data_table_endpoint(body: DataTableRequest, settings: Settings = Depen
     simple = to_simple_table(data_table)
     citations = to_citation_table(data_table)
     debug = to_debug_json(data_table)
+    pptx_table = to_pptx_table(data_table)
+    pptx = await asyncio.to_thread(
+        render_pptx,
+        [pptx_table],
+        pptx_table["title"],
+        settings,
+    )
 
     return {
         "type": "data_table",
@@ -47,4 +61,5 @@ async def data_table_endpoint(body: DataTableRequest, settings: Settings = Depen
         "metrics": data_table.metrics,
         "debug_trace": data_table.debug_trace,
         "warnings": data_table.warnings,
+        "pptx": pptx,
     }
