@@ -12,7 +12,12 @@ from pydantic import BaseModel
 
 from app.config import Settings
 from app.models.data_table import EvidenceBlock
-from app.prompts.data_table import DISCOVER_COLUMNS_SYSTEM, TABLE_COMPOSER_SYSTEM, TABLE_SINGLE_CALL_SYSTEM
+from app.prompts.data_table import (
+    CONCEPT_SUMMARY_SYSTEM,
+    DISCOVER_COLUMNS_SYSTEM,
+    TABLE_COMPOSER_SYSTEM,
+    TABLE_SINGLE_CALL_SYSTEM,
+)
 from app.services.data_table.source_table_rows import (
     extract_source_table_candidates,
     parse_markdown_table,
@@ -650,6 +655,101 @@ async def compose_result_summary(
     rows = _rows_from_fixed_columns(data.get("rows", []), fixed_columns)
     if len(rows) > _LLM_MAX_ROWS:
         rows = rows[:_LLM_MAX_ROWS]
+
+    return DraftDataTable(headers=fixed_columns, rows=rows, notes=[])
+
+
+# Concept tables can be larger than benchmark summaries (one row per concept).
+_CONCEPT_MAX_ROWS = 20
+
+
+def _format_all_evidence_for_concepts(
+    evidence_store: list[EvidenceBlock],
+    allowed_ids: set[str],
+    max_items: int = 120,
+    char_limit: int = 2000,
+) -> str:
+    """Feed full text evidence (and any table markdown) for concept synthesis.
+
+    Generous limits: rich NotebookLM-style cells require the model to actually
+    see the explanations, analogies, and numbers in the source text.
+    """
+    lines = []
+    for b in evidence_store:
+        if b.evidence_id not in allowed_ids:
+            continue
+        text = (b.text or "")[:char_limit].replace("\n", " ")
+        table_section = f"\nTable:\n{b.table_markdown[:1000]}" if b.table_markdown else ""
+        if not text and not table_section:
+            continue
+        lines.append(f"[evidence_id={b.evidence_id}] {b.title or ''}\n{text}{table_section}")
+        if len(lines) >= max_items:
+            break
+    return "\n\n---\n\n".join(lines) or "(no evidence)"
+
+
+async def compose_concept_summary(
+    hint: str,
+    plan: DataTablePlan,
+    evidence_store: list[EvidenceBlock],
+    settings: Settings,
+    repair_errors: list[str] | None = None,
+) -> DraftDataTable:
+    """NotebookLM-style concept-synthesis composer for explanatory sources.
+
+    ONE long-context LLM call over all text evidence; one rich row per concept
+    from plan.candidate_rows, columns taken directly from the plan.
+    """
+    client = AsyncOpenAI(
+        api_key=settings.OPENAI_API_KEY,
+        base_url=settings.OPENAI_BASE_URL or None,
+    )
+
+    allowed_ids = _allowed_evidence_ids(plan, evidence_store)
+    fixed_columns = [c.name for c in plan.columns] if plan.columns else []
+
+    evidence_str = _format_all_evidence_for_concepts(evidence_store, allowed_ids)
+    concepts = ", ".join(plan.candidate_rows) if plan.candidate_rows else "(enumerate them from the evidence)"
+
+    repair_section = ""
+    if repair_errors:
+        repair_section = (
+            "\n\nPREVIOUS ATTEMPT HAD ERRORS — repair these issues:\n"
+            + "\n".join(f"- {e}" for e in repair_errors)
+            + "\n"
+        )
+
+    user_msg = (
+        f"User hint: {hint}\n\n"
+        f"Table title: {plan.table_title}\n"
+        f"Purpose: {plan.table_purpose}\n"
+        f"Columns to fill (use exactly, in order): {fixed_columns}\n"
+        f"Concepts that must become rows: {concepts}\n\n"
+        f"=== Evidence ===\n{evidence_str}"
+        f"{repair_section}\n\n"
+        f"Produce at most {_CONCEPT_MAX_ROWS} rows. Return compact JSON only."
+    )
+
+    try:
+        response = await client.chat.completions.create(
+            model=settings.OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": CONCEPT_SUMMARY_SYSTEM},
+                {"role": "user", "content": user_msg},
+            ],
+            max_completion_tokens=128000,
+            temperature=0.0,
+            response_format={"type": "json_object"},
+        )
+        raw = response.choices[0].message.content or "{}"
+        data = json.loads(raw)
+    except Exception as exc:
+        logger.warning("compose_concept_summary call failed: %s", exc)
+        return DraftDataTable(headers=fixed_columns, rows=[], notes=[str(exc)])
+
+    rows = _rows_from_fixed_columns(data.get("rows", []), fixed_columns)
+    if len(rows) > _CONCEPT_MAX_ROWS:
+        rows = rows[:_CONCEPT_MAX_ROWS]
 
     return DraftDataTable(headers=fixed_columns, rows=rows, notes=[])
 

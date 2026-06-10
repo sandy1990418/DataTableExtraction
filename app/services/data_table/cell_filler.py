@@ -14,7 +14,6 @@ from app.models.data_table import (
     EvidenceBlock,
     GroundedCell,
     RowEntity,
-    SourceRef,
 )
 from app.prompts.data_table import CELL_FILL_SYSTEM
 

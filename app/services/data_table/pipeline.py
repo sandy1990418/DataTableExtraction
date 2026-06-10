@@ -15,12 +15,13 @@ from app.services.data_table.exporters import compute_table_metrics
 from app.services.data_table.source_table_summary import summarize_source_tables
 from app.services.data_table.result_summary_agent import ResultSummaryPlan, run_result_summary_agent
 from app.services.data_table.table_composer import (
-    RESULT_SUMMARY_HEADERS,
     build_draft_from_source_table,
+    compose_concept_summary,
     compose_data_table,
     compose_long_form_from_source_tables,
     compose_result_summary,
 )
+from app.services.data_table.concept_workflow import run_concept_workflow
 from app.services.data_table.table_planner import _FALLBACK_PLAN, plan_data_table
 from app.services.data_table.table_verifier import verify_draft_table
 from app.services.data_table.text_table_extractor import extract_tables_from_text_blocks, inject_extracted_tables
@@ -69,10 +70,21 @@ async def generate_data_table(
         "tables": [s.model_dump() for s in source_table_summaries],
     })
 
-    # Stage 2b: ResultSummaryAgent — paper-level understanding before planning
-    result_summary_plan: ResultSummaryPlan | None = await run_result_summary_agent(
-        hint, evidence_store, source_table_summaries, settings, debug_trace=debug_trace
-    )
+    # Stage 2b: ResultSummaryAgent — paper-level understanding before planning.
+    # Only run when the evidence looks like academic benchmark content (numeric source
+    # tables); for explanatory content (transcripts, articles) its method/baseline
+    # framing degrades the plan into a forced academic table.
+    has_numeric_tables = any(s.numeric_column_count > 0 for s in source_table_summaries)
+    result_summary_plan: ResultSummaryPlan | None = None
+    if has_numeric_tables:
+        result_summary_plan = await run_result_summary_agent(
+            hint, evidence_store, source_table_summaries, settings, debug_trace=debug_trace
+        )
+    else:
+        debug_trace.append({
+            "stage": "result_summary_agent_skipped",
+            "reason": "no numeric source tables — content treated as explanatory (concept_summary path)",
+        })
 
     # Stage 3: LLM table planner
     plan = await plan_data_table(
@@ -114,7 +126,19 @@ async def generate_data_table(
     is_fallback_plan = plan.reason == _FALLBACK_PLAN.reason
     draft = None
 
-    if plan.table_purpose_type == "result_summary" and not is_fallback_plan:
+    if plan.table_purpose_type == "concept_summary" and not is_fallback_plan:
+        draft = await run_concept_workflow(
+            hint, plan, evidence_store, settings, debug_trace=debug_trace
+        )
+        debug_trace.append({
+            "stage": "table_composition",
+            "method": "concept_workflow",
+            "table_purpose_type": plan.table_purpose_type,
+            "draft_row_count": len(draft.rows),
+            "draft_headers": draft.headers,
+        })
+
+    elif plan.table_purpose_type == "result_summary" and not is_fallback_plan:
         draft = await compose_result_summary(
             hint, plan, evidence_store, source_table_summaries, settings,
             result_summary_plan=result_summary_plan,
@@ -188,7 +212,12 @@ async def generate_data_table(
         coverage_errors = [
             f"Missing rows for: {missing_candidates}. You MUST include a row for each of these methods/systems."
         ]
-        if plan.table_purpose_type == "result_summary":
+        if plan.table_purpose_type == "concept_summary":
+            coverage_draft = await compose_concept_summary(
+                hint, plan, evidence_store, settings,
+                repair_errors=coverage_errors,
+            )
+        elif plan.table_purpose_type == "result_summary":
             coverage_draft = await compose_result_summary(
                 hint, plan, evidence_store, source_table_summaries, settings,
                 result_summary_plan=result_summary_plan,
@@ -218,7 +247,12 @@ async def generate_data_table(
     severe_errors = [e for e in errors if any(kw in e for kw in _SEVERE_ERROR_KEYWORDS)]
     if severe_errors and _REPAIR_ROUNDS > 0:
         logger.info("Triggering citation repair loop: %d severe errors", len(severe_errors))
-        if plan.table_purpose_type == "result_summary" and not is_fallback_plan:
+        if plan.table_purpose_type == "concept_summary" and not is_fallback_plan:
+            repaired_draft = await compose_concept_summary(
+                hint, plan, evidence_store, settings,
+                repair_errors=severe_errors,
+            )
+        elif plan.table_purpose_type == "result_summary" and not is_fallback_plan:
             repaired_draft = await compose_result_summary(
                 hint, plan, evidence_store, source_table_summaries, settings,
                 result_summary_plan=result_summary_plan,

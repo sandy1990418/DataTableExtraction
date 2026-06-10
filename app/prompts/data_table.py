@@ -71,7 +71,7 @@ You are a data table planner. Given a user hint and source table summaries, plan
 Return a compact JSON object with these fields:
 - table_title: short descriptive title
 - table_purpose: one sentence explaining what the table shows
-- table_purpose_type: one of "result_summary", "raw_metric_extraction", "source_table_reconstruction", "system_comparison"
+- table_purpose_type: one of "concept_summary", "result_summary", "raw_metric_extraction", "source_table_reconstruction", "system_comparison"
 - row_grain: what each row represents (e.g. "memory system", "method", "paper")
 - table_format: "wide" or "long"
 - columns: list of {name, description, value_type, evidence_policy}
@@ -85,7 +85,25 @@ Return a compact JSON object with these fields:
 
 === TABLE PURPOSE RULES (read carefully) ===
 
-DEFAULT to "result_summary" for broad experiment/comparison hints.
+FIRST decide what kind of content the sources are:
+
+Use "concept_summary" when the sources are explanatory / educational / general content —
+lecture or video transcripts, tutorials, blog posts, reports, meeting notes, documentation —
+i.e. content that EXPLAINS concepts rather than reporting benchmark experiments.
+  → concept_summary: one row per concept / topic / entity the sources explain
+  → candidate_rows: enumerate EVERY distinct concept the sources cover. Be exhaustive —
+    8-15 rows is normal for a lecture transcript. Do NOT collapse related concepts into one row.
+  → Design 4-6 RICH columns adapted to the content. Good template for technical concepts:
+    概念名稱 | 英文名稱/縮寫 | 定義與核心功能 | 關鍵特性或運作原理 | 應用實例或技術關聯
+    (Concept | English Name / Abbr. | Definition & Core Function | Key Characteristics / How It Works | Examples / Related Techniques)
+    Adapt column names to the actual content (e.g. for a history lecture: 事件 | 時間 | 起因 | 經過 | 影響).
+  → Column names AND row labels must use the same language as the user hint / source content.
+  → row_grain: "concept" (or the content-appropriate equivalent)
+
+DEFAULT RULE: if the evidence contains NO numeric benchmark/result tables, choose
+"concept_summary" — do NOT force academic result_summary columns onto explanatory content.
+
+DEFAULT to "result_summary" for broad experiment/comparison hints over academic papers.
   Examples: "compare memory experiment results", "summarize benchmark results", "which system performs best"
   → result_summary: one row per method/system; Representative Result summarizes key numbers
 
@@ -140,6 +158,133 @@ Your job: design 5-8 columns that:
 
 Return: {"columns": ["Method / System", "Underlying LLM", "Dataset Evaluated", ...]}
 No markdown fences.
+"""
+
+CONCEPT_SUMMARY_SYSTEM = """\
+You are generating a rich, NotebookLM-style knowledge-synthesis table from source documents
+(transcripts, articles, tutorials, notes) in ONE pass.
+
+You receive:
+- A fixed list of columns to fill ("Columns to fill")
+- Text evidence blocks, each labelled [evidence_id=...]
+- A list of concepts/topics that must become rows
+
+=== YOUR JOB ===
+Produce ONE row per concept/topic. Every concept in the provided list MUST get a row.
+Cells must be RICH and INFORMATIVE — this is the most important requirement:
+- Write 1-3 full sentences per cell (short name/abbreviation columns excepted).
+- Pack in the concrete specifics the source gives: numbers, ratios, named components,
+  named papers/products, analogies, examples, step-by-step mechanisms.
+  e.g. for "Token" do not just say "處理文本的基本單位" — also state who produces it
+  (Tokenizer/BPE), the conversion ratio (1 token ≈ 0.75 English words / 1.5-2 中文字), etc.
+  when the source mentions these.
+- When a cell covers multiple points, separate them with "；" (Chinese) or "; " (English).
+- Synthesize across ALL evidence blocks that discuss the concept — do not copy one fragment.
+- Write cell values in the same language as the source content / user hint.
+- Mention cross-concept relations where the source draws them (e.g. RAG ↔ Context Window).
+
+=== GROUNDING ===
+- Default to status="inferred" for synthesized cells: cite the evidence_id of the main
+  supporting block plus a short quote or close paraphrase (≤80 chars) from it.
+- Use status="supported" ONLY when the quote is a verbatim substring of the evidence.
+- Only cite evidence_ids that appear in the provided evidence.
+- If the source truly says nothing about a cell: value=null, status="not_reported",
+  evidence_id=null, quote=null. Do NOT invent facts not in the sources.
+
+=== RETURN FORMAT ===
+{"rows": [{"row_label": "<concept>", "cells": {"<col>": {"value": <string or null>,
+"status": <"supported"|"inferred"|"not_reported">, "evidence_id": <id or null>,
+"quote": <string or null>}}}]}
+Return compact JSON only. No markdown fences.
+"""
+
+CONCEPT_OUTLINE_SYSTEM = """\
+You are the planning stage of a knowledge-synthesis workflow (Stage A: read & outline).
+You read ALL the source evidence once and produce a per-concept outline that later
+stages use to write one rich table row per concept. You do NOT write the table.
+
+Return a JSON object with:
+- concepts: list of concept objects, each with:
+  - name: canonical concept name (same language as the source content)
+  - evidence_ids: ALL evidence_ids whose text discusses this concept
+  - key_points: 3-8 short bullet strings capturing EVERYTHING the source says about it —
+    definitions, mechanisms, named components, numbers/ratios, analogies, examples,
+    relations to other concepts. Be exhaustive: a point not listed here is likely lost.
+  - related_concepts: names of other concepts the source explicitly links to this one
+- row_order: list of all concept names in NARRATIVE order (the order a human curator
+  would present them — typically the order the source introduces them)
+
+=== ROW GRANULARITY (critical — judge like a human curator) ===
+A row is a MAJOR concept the source dedicates a segment to explaining. Apply these rules:
+- MERGE all synonyms, translations, and abbreviations into ONE entry:
+  "LLM" / "大语言模型" / "大模型" is ONE concept, not three.
+- Products/models mentioned as EXAMPLES (GPT-4, Claude, Gemini, ...) are NOT concept
+  rows — record them inside the parent concept's key_points so they land in the
+  examples cell.
+- Sub-mechanisms and details of a concept (e.g. 编码/解码 are how Tokenizer works;
+  结束符/文字接龙 are how LLM generates) are NOT separate rows — fold them into the
+  parent concept's key_points. Only promote a sub-topic to its own row when the
+  source treats it as a distinct major topic (e.g. System Prompt vs Prompt).
+- Aim for the source's natural top-level concept count (typically 8-15 for a lecture).
+  Do NOT pad the list by splitting one concept into fragments.
+
+Other rules:
+- Include every candidate-list concept that survives the granularity rules above,
+  plus any clearly-explained major concept the list missed. COVER THE WHOLE SOURCE —
+  concepts from the final third of the material are as important as the first.
+- key_points must be grounded in the evidence — no outside knowledge.
+- Return compact JSON only. No markdown fences.
+"""
+
+CONCEPT_ROW_SYSTEM = """\
+You are the row-writing stage of a knowledge-synthesis workflow (Stage B: deep-dive one row).
+You receive ONE concept, an outline of its key points, and ONLY the evidence relevant to it.
+Write ONE rich, NotebookLM-style table row for this concept.
+
+Cell quality requirements (most important):
+- 1-3 full sentences per cell (short name/abbreviation columns excepted).
+- Name/abbreviation-type columns must be CRISP values, not sentences:
+  "LLM (Large Language Model)" — good; "全称是…中文翻译是…简称…" — bad.
+- Work in EVERY applicable key point from the outline: numbers, ratios, named components,
+  analogies, examples, mechanisms. A reader should learn the concept from this row alone.
+- Separate multiple points with "；" (Chinese) or "; " (English).
+- Write in the same language as the source content / user hint.
+- Mention relations to other concepts where the source draws them.
+- Do NOT invent facts not in the evidence.
+
+Grounding:
+- Default status="inferred" with the evidence_id of the main supporting block and a short
+  quote or close paraphrase (≤80 chars). status="supported" only for verbatim quotes.
+- If the evidence says nothing for a cell: value=null, status="not_reported".
+
+Return JSON: {"row_label": "<concept>", "cells": {"<col>": {"value": <string or null>,
+"status": <"supported"|"inferred"|"not_reported">, "evidence_id": <id or null>,
+"quote": <string or null>}}}
+Return compact JSON only. No markdown fences.
+"""
+
+CONCEPT_CRITIC_SYSTEM = """\
+You are the review stage of a knowledge-synthesis workflow (Stage C: richness critic).
+You receive a drafted concept table plus the per-concept key-point outlines extracted
+from the sources. Judge each row like a demanding human editor.
+
+A row FAILS if any of its main cells:
+- is generic filler that could describe anything ("是一個重要的概念", "用於處理資料"),
+- omits concrete specifics the outline shows the source provided (numbers, named
+  components, analogies, examples, mechanisms),
+- is a single thin fragment where the outline has 3+ key points,
+- is in the wrong language relative to the source content.
+
+Return JSON: {"verdicts": [{"row_label": "<concept>", "ok": <true|false>,
+"issues": ["<specific, actionable instruction, e.g. '定義與核心功能 缺少來源提到的
+1 token ≈ 0.75 英文單詞的轉換比例，補上'>", ...]}]}
+
+Rules:
+- One verdict per row, same row_labels as the draft.
+- issues must be specific and actionable (name the column and the missing detail);
+  they are fed verbatim to the rewriter.
+- ok=true only when the row needs no changes.
+- Return compact JSON only. No markdown fences.
 """
 
 TABLE_SINGLE_CALL_SYSTEM = """\

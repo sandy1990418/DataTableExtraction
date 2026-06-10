@@ -10,7 +10,6 @@ from app.models.data_table import (
     EvidenceBlock,
     GroundedCell,
     RowEntity,
-    SourceRef,
 )
 from app.services.data_table.source_table_rows import parse_markdown_table
 

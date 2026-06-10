@@ -61,6 +61,7 @@ class DataTablePlan(BaseModel):
     table_title: str
     table_purpose: str
     table_purpose_type: Literal[
+        "concept_summary",
         "result_summary",
         "raw_metric_extraction",
         "source_table_reconstruction",
@@ -86,6 +87,20 @@ class DataTablePlan(BaseModel):
 _RESULT_SUMMARY_DEFAULT_COLUMNS = [
     PlannedColumn(name=h, description=h, value_type="string", evidence_policy="mixed")
     for h in RESULT_SUMMARY_HEADERS
+]
+
+# Default columns for concept_summary when LLM omits columns (language-neutral fallback;
+# the planner normally designs columns in the source/hint language).
+CONCEPT_SUMMARY_HEADERS = [
+    "Concept",
+    "Name / Abbreviation",
+    "Definition & Core Function",
+    "Key Characteristics / How It Works",
+    "Examples / Related Techniques",
+]
+_CONCEPT_SUMMARY_DEFAULT_COLUMNS = [
+    PlannedColumn(name=h, description=h, value_type="string", evidence_policy="text")
+    for h in CONCEPT_SUMMARY_HEADERS
 ]
 
 _FALLBACK_PLAN = DataTablePlan(
@@ -158,6 +173,24 @@ def _format_summaries(summaries: list[SourceTableSummary]) -> str:
     return "\n".join(lines)
 
 
+def _format_text_evidence(
+    evidence_store: list[EvidenceBlock],
+    max_items: int = 80,
+    char_limit: int = 300,
+) -> str:
+    """Preview of plain-text evidence so the planner can plan from transcript/article
+    content even when there are no structured source tables."""
+    lines: list[str] = []
+    for b in evidence_store:
+        if b.table_markdown or not b.text:
+            continue
+        preview = (b.text or "")[:char_limit].replace("\n", " ")
+        lines.append(f"[{b.evidence_id}] {b.title or ''}: {preview}")
+        if len(lines) >= max_items:
+            break
+    return "\n".join(lines) or "(no text evidence)"
+
+
 def _parse_plan(data: dict) -> DataTablePlan:
     columns = []
     for col in data.get("columns", []):
@@ -196,7 +229,7 @@ def _parse_plan(data: dict) -> DataTablePlan:
         table_format = "wide"
 
     purpose_type = data.get("table_purpose_type", "result_summary")
-    if purpose_type not in ("result_summary", "raw_metric_extraction", "source_table_reconstruction", "system_comparison"):
+    if purpose_type not in ("concept_summary", "result_summary", "raw_metric_extraction", "source_table_reconstruction", "system_comparison"):
         purpose_type = "result_summary"
 
     # For result_summary: enforce standard columns if LLM returned generic/empty columns.
@@ -207,6 +240,8 @@ def _parse_plan(data: dict) -> DataTablePlan:
         or len(columns) < 3
     ):
         columns = list(_RESULT_SUMMARY_DEFAULT_COLUMNS)
+    elif purpose_type == "concept_summary" and len(columns) < 3:
+        columns = list(_CONCEPT_SUMMARY_DEFAULT_COLUMNS)
 
     return DataTablePlan(
         table_title=str(data.get("table_title", "Data Table")).strip() or "Data Table",
@@ -257,10 +292,12 @@ async def plan_data_table(
             "Use must_include to populate candidate_rows. Add exclude_as_rows to excluded_candidate_rows.\n"
         )
 
-    # keep the user message short: summaries only, no long evidence text
+    # summaries + text previews: text previews are essential when the sources are
+    # transcripts/articles with no structured tables (concept_summary mode).
     user_msg = (
         f"User hint: {hint}\n\n"
-        f"Source table summaries:\n{_format_summaries(source_table_summaries)}"
+        f"Source table summaries:\n{_format_summaries(source_table_summaries)}\n\n"
+        f"Text evidence previews:\n{_format_text_evidence(evidence_store)}"
         f"{plan_guidance}\n\n"
         "Return compact JSON only. No markdown fences."
     )
@@ -292,7 +329,8 @@ async def plan_data_table(
         return _FALLBACK_PLAN
 
     # Apply ResultSummaryPlan overrides: enforce must_include, columns, exclude_as_rows.
-    if result_summary_plan is not None:
+    # Skip for concept_summary — the agent's method/baseline framing does not apply there.
+    if result_summary_plan is not None and plan.table_purpose_type != "concept_summary":
         from app.services.data_table.result_summary_agent import RESULT_SUMMARY_COLUMNS as _RSC  # noqa: PLC0415
         rsp = result_summary_plan
         if rsp.must_include:

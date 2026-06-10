@@ -91,7 +91,7 @@ def _select_rich_sections(blocks: list[EvidenceBlock], max_chars: int) -> str:
     Blocks are de-duplicated and rendered in original document order.
     """
     n = len(blocks)
-    idx_by_id = {b.evidence_id: i for i, b in enumerate(blocks)}
+    {b.evidence_id: i for i, b in enumerate(blocks)}
 
     # Step 1: collect anchor windows
     selected_indices: set[int] = set()
