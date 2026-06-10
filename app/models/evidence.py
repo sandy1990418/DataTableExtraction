@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import Literal
 
 EvidenceKind = Literal[
@@ -23,6 +23,3 @@ class EvidenceItem:
     content: str
     headers: list[str] = field(default_factory=list)
     rows: list[list[str]] = field(default_factory=list)
-
-    def to_dict(self) -> dict:
-        return asdict(self)

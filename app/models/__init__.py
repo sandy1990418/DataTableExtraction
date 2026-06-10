@@ -6,14 +6,6 @@
 
 from app.models.documents import ImageRef, MarkdownTable, ParsedDocument, TextSection
 from app.models.evidence import EvidenceItem, EvidenceKind
-from app.models.schemas import (
-    AnalyzeRequest,
-    ChatRequest,
-    DocumentInput,
-    EvidenceRequest,
-    OutlineRequest,
-    RenderRequest,
-)
 
 __all__ = [
     # domain dataclasses
@@ -23,11 +15,4 @@ __all__ = [
     "ParsedDocument",
     "EvidenceItem",
     "EvidenceKind",
-    # API schemas
-    "DocumentInput",
-    "EvidenceRequest",
-    "OutlineRequest",
-    "RenderRequest",
-    "AnalyzeRequest",
-    "ChatRequest",
 ]

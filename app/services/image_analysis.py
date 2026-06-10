@@ -7,7 +7,7 @@ import logging
 from openai import AsyncOpenAI
 
 from app.config import Settings
-from app.prompts import IMAGE_SYSTEM
+from app.prompts.image import IMAGE_SYSTEM
 
 logger = logging.getLogger(__name__)
 

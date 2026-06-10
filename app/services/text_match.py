@@ -1,9 +1,7 @@
-"""Language-aware keyword tokenizer shared by the evidence selectors.
+"""Language-aware keyword tokenizer for the data-table evidence store.
 
-The original selectors tokenized with ``[A-Za-z]`` only, so a Chinese (or any
-CJK) hint produced an empty query and every item scored 0 on overlap. This
-module keeps the Latin behaviour and adds CJK uni/bi-grams so non-English hints
-actually drive retrieval.
+It keeps Latin tokenization and adds CJK uni/bi-grams so non-English evidence
+also receives useful keywords.
 """
 
 from __future__ import annotations
@@ -41,19 +39,3 @@ def keywords(text: str, stopwords: frozenset[str] | set[str] = frozenset()) -> C
     terms = [word for word in _LATIN.findall(lowered) if word not in stopwords]
     terms.extend(term for term in _cjk_terms(text) if term not in stopwords)
     return Counter(terms)
-
-
-def matched_terms(query: Counter[str], target: Counter[str]) -> list[str]:
-    """Terms present in both query and target, ordered by query weight (for tracing)."""
-    matched = [
-        (term, min(count, target.get(term, 0)))
-        for term, count in query.items()
-        if target.get(term, 0)
-    ]
-    matched.sort(key=lambda entry: -entry[1])
-    return [term for term, _ in matched]
-
-
-def overlap_score(query: Counter[str], target: Counter[str]) -> int:
-    """Capped term-frequency overlap between a query and a target multiset."""
-    return sum(min(count, target.get(term, 0)) for term, count in query.items())

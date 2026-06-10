@@ -68,12 +68,9 @@ def test_pptx_table_export():
     pptx_table = to_pptx_table(_make_table())
 
     assert pptx_table == {
-        "table_id": "data_table",
         "title": "Speech Models",
-        "kind": "extracted_summary",
         "headers": ["Model", "Streaming", "BLEU"],
         "rows": [["ModelA", "Yes", "45.6"], ["ModelB", "", ""]],
-        "layout": "table_only",
     }
 
 

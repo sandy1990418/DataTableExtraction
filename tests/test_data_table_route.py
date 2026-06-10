@@ -18,6 +18,19 @@ from app.routes import data_table as data_table_route
 from app.tools import table_pptx
 
 
+def test_app_exposes_only_data_table_business_routes() -> None:
+    routes = {
+        (method, route.path)
+        for route in create_app().routes
+        for method in getattr(route, "methods", [])
+    }
+
+    assert ("POST", "/data-table") in routes
+    assert ("GET", "/download/{token}") in routes
+    removed_paths = {"/analyze", "/chat", "/evidence", "/health", "/outline", "/render"}
+    assert not any(path in removed_paths for _, path in routes)
+
+
 def _make_table() -> GroundedDataTable:
     return GroundedDataTable(
         **{
@@ -86,3 +99,19 @@ def test_data_table_response_includes_downloadable_pptx(monkeypatch, tmp_path) -
     )
     assert table_shape.table.cell(1, 0).text == "Model A"
     assert table_shape.table.cell(1, 1).text == "92.5"
+
+
+def test_data_table_empty_evidence_flow_still_exports_pptx(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(table_pptx, "STORE_DIR", tmp_path)
+    client = TestClient(create_app())
+
+    response = client.post(
+        "/data-table",
+        json={"documents": [{"content": ""}], "analyze_images": False},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["table"] == {"headers": ["Entity"], "rows": []}
+    assert payload["pptx"]["type"] == "download"
+    assert client.get(payload["pptx"]["url"]).status_code == 200

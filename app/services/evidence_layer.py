@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from collections import Counter
-
 from app.models import EvidenceItem
 
 
@@ -75,18 +73,3 @@ def build_evidence_layer(
                     ))
 
     return items
-
-
-def summarize_evidence(items: list[EvidenceItem]) -> str:
-    lines = [f"Evidence layer: {len(items)} items"]
-    counts = Counter(item.kind for item in items)
-    for kind, count in sorted(counts.items()):
-        lines.append(f"  {kind}: {count}")
-    lines.append("")
-    for item in items:
-        if item.kind in ("markdown_table", "image_table"):
-            lines.append(f"[{item.kind}] {item.title} — {item.content} (source: {item.source_ref})")
-        else:
-            preview = item.content[:120].replace("\n", " ")
-            lines.append(f"[{item.kind}] {item.title}: {preview}")
-    return "\n".join(lines)

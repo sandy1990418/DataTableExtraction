@@ -21,7 +21,6 @@ class Settings:
         self.LLM_TIMEOUT_SECONDS: float = float(os.getenv("LLM_TIMEOUT_SECONDS", "120"))
         self.LLM_MAX_RETRIES: int = int(os.getenv("LLM_MAX_RETRIES", "1"))
         self.DOWNLOAD_TTL_SECONDS: int = int(os.getenv("DOWNLOAD_TTL_SECONDS", "600"))
-        self.SESSION_TTL_SECONDS: int = int(os.getenv("SESSION_TTL_SECONDS", "1800"))
         for key, value in overrides.items():
             setattr(self, key, value)
 

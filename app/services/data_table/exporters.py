@@ -59,16 +59,9 @@ def to_simple_table(data_table: GroundedDataTable) -> dict:
 def to_pptx_table(data_table: GroundedDataTable) -> dict:
     simple = to_simple_table(data_table)
     return {
-        "table_id": "data_table",
         "title": data_table.schema_.title.strip() or "Data Table",
-        "kind": (
-            "source_table"
-            if data_table.schema_.table_type == "source_table"
-            else "extracted_summary"
-        ),
         "headers": simple["headers"],
         "rows": simple["rows"],
-        "layout": "table_only",
     }
 
 
